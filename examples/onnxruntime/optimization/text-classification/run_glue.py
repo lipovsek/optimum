@@ -23,15 +23,14 @@ import os
 import sys
 from dataclasses import dataclass, field
 from functools import partial
-from pathlib import Path
 from typing import Optional
 
 import datasets
 import numpy as np
 import transformers
 from datasets import load_dataset
+from evaluate import load
 from transformers import (
-    AutoConfig,
     AutoTokenizer,
     EvalPrediction,
     HfArgumentParser,
@@ -41,10 +40,9 @@ from transformers import (
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
-from evaluate import load
 from optimum.onnxruntime import ORTModelForSequenceClassification, ORTOptimizer
-from optimum.onnxruntime.configuration import OptimizationConfig, ORTConfig
-from optimum.onnxruntime.model import ORTModel
+from optimum.onnxruntime.configuration import OptimizationConfig
+from optimum.onnxruntime.utils import evaluation_loop
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -252,7 +250,6 @@ def main():
         )
 
     os.makedirs(training_args.output_dir, exist_ok=True)
-    optimized_model_path = os.path.join(training_args.output_dir, "model_optimized.onnx")
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
@@ -264,17 +261,21 @@ def main():
     )
 
     # Export the model
-    model = ORTModelForSequenceClassification.from_pretrained(model_args.model_name_or_path, from_transformers=True)
+    model = ORTModelForSequenceClassification.from_pretrained(model_args.model_name_or_path, export=True)
 
     # Create the optimizer
     optimizer = ORTOptimizer.from_pretrained(model)
 
     # Optimize the model
-    optimizer.optimize(
+    optimized_model_path = optimizer.optimize(
         optimization_config=optimization_config,
         save_dir=training_args.output_dir,
         use_external_data_format=onnx_export_args.use_external_data_format,
         one_external_file=onnx_export_args.one_external_file,
+    )
+
+    model = ORTModelForSequenceClassification.from_pretrained(
+        optimized_model_path, provider=optim_args.execution_provider
     )
 
     # Prepare the dataset downloading, preprocessing and metric creation to perform the evaluation and / or the
@@ -395,7 +396,7 @@ def main():
 
         try:
             eval_dataset = eval_dataset.align_labels_with_mapping(label2id=model.config.label2id, label_column="label")
-        except Exception as e:
+        except Exception:
             logger.warning(
                 f"\nModel label mapping: {model.config.label2id}"
                 f"\nDataset label features: {eval_dataset.features['label']}"
@@ -410,15 +411,15 @@ def main():
             desc="Running tokenizer on the evaluation dataset",
         )
 
-        ort_model = ORTModel(
-            optimized_model_path,
-            execution_provider=optim_args.execution_provider,
+        outputs = evaluation_loop(
+            model=model,
+            eval_dataset=eval_dataset,
             compute_metrics=compute_metrics,
             label_names=["label"],
         )
-        outputs = ort_model.evaluation_loop(eval_dataset)
+
         # Save metrics
-        with open(os.path.join(training_args.output_dir, f"eval_results.json"), "w") as f:
+        with open(os.path.join(training_args.output_dir, "eval_results.json"), "w") as f:
             json.dump(outputs.metrics, f, indent=4, sort_keys=True)
 
     # Prediction
@@ -438,14 +439,16 @@ def main():
             desc="Running tokenizer on the test dataset",
         )
 
-        ort_model = ORTModel(
-            optimized_model_path, execution_provider=optim_args.execution_provider, label_names=["label"]
+        outputs = evaluation_loop(
+            model=model,
+            eval_dataset=eval_dataset,
+            compute_metrics=compute_metrics,
+            label_names=["label"],
         )
-        outputs = ort_model.evaluation_loop(predict_dataset)
         predictions = np.squeeze(outputs.predictions) if is_regression else np.argmax(outputs.predictions, axis=1)
 
         # Save predictions
-        output_predictions_file = os.path.join(training_args.output_dir, f"prediction.txt")
+        output_predictions_file = os.path.join(training_args.output_dir, "prediction.txt")
         with open(output_predictions_file, "w") as writer:
             logger.info(f"***** Predict results {data_args.task_name} *****")
             writer.write("index\tprediction\n")

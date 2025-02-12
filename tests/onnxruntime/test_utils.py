@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 
+import onnxruntime as ort
 import torch
 
 from optimum.onnxruntime.configuration import AutoQuantizationConfig, OptimizationConfig, ORTConfig
@@ -9,12 +10,18 @@ from optimum.onnxruntime.utils import get_device_for_provider, get_provider_for_
 
 class ProviderAndDeviceGettersTest(unittest.TestCase):
     def test_get_device_for_provider(self):
-        self.assertEqual(get_device_for_provider("CPUExecutionProvider"), torch.device("cpu"))
-        self.assertEqual(get_device_for_provider("CUDAExecutionProvider"), torch.device("cuda"))
+        self.assertEqual(get_device_for_provider("CPUExecutionProvider", provider_options={}), torch.device("cpu"))
+        self.assertEqual(
+            get_device_for_provider("CUDAExecutionProvider", provider_options={"device_id": 1}), torch.device("cuda:1")
+        )
 
     def test_get_provider_for_device(self):
         self.assertEqual(get_provider_for_device(torch.device("cpu")), "CPUExecutionProvider")
-        self.assertEqual(get_provider_for_device(torch.device("cuda")), "CUDAExecutionProvider")
+
+        if "ROCMExecutionProvider" in ort.get_available_providers():
+            self.assertEqual(get_provider_for_device(torch.device("cuda")), "ROCMExecutionProvider")
+        else:
+            self.assertEqual(get_provider_for_device(torch.device("cuda")), "CUDAExecutionProvider")
 
 
 class ORTConfigTest(unittest.TestCase):

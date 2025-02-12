@@ -18,29 +18,46 @@ import unittest
 from functools import partial
 from pathlib import Path
 
+from onnx import load as onnx_load
+from onnxruntime import __version__ as ort_version
+from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
+from packaging.version import Version, parse
+from parameterized import parameterized
 from transformers import AutoTokenizer
 
-from onnx import load as onnx_load
-from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
-from optimum.onnxruntime import ORTQuantizer
-from optimum.onnxruntime.configuration import AutoCalibrationConfig, ORTConfig, QuantizationConfig
-from optimum.onnxruntime.modeling_ort import ORTModelForSequenceClassification
-from optimum.onnxruntime.modeling_seq2seq import ORTModelForSeq2SeqLM
-from parameterized import parameterized
+from optimum.onnxruntime import (
+    AutoCalibrationConfig,
+    AutoQuantizationConfig,
+    ORTConfig,
+    ORTModelForCausalLM,
+    ORTModelForFeatureExtraction,
+    ORTModelForSeq2SeqLM,
+    ORTModelForSequenceClassification,
+    ORTQuantizer,
+    QuantizationConfig,
+)
+from optimum.utils.testing_utils import grid_parameters
 
 
 class ORTQuantizerTest(unittest.TestCase):
     LOAD_CONFIGURATION = {
         "local_asset": {
-            "model_or_path": "assets/onnx",
+            "model_or_path": "tests/assets/onnx",
         },
         "local_asset_different_name": {
-            "model_or_path": "assets/onnx",
+            "model_or_path": "tests/assets/onnx",
             "file_name": "different_name.onnx",
         },
         "ort_model_class": {
             "model_or_path": ORTModelForSequenceClassification.from_pretrained(
                 "optimum/distilbert-base-uncased-finetuned-sst-2-english"
+            )
+        },
+        "ort_model_with_onnx_model_in_subfolder": {
+            "model_or_path": ORTModelForFeatureExtraction.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                subfolder="onnx",
+                file_name="model.onnx",
             )
         },
     }
@@ -54,7 +71,7 @@ class ORTQuantizerTest(unittest.TestCase):
     def test_fail_from_pretrained_method(self):
         with self.assertRaises(Exception) as context:
             ORTQuantizer.from_pretrained("bert-base-cased")
-        self.assertIn("Unable to load model from bert-base-cased", str(context.exception))
+        self.assertIn("Could not find any ONNX model file in bert-base-cased", str(context.exception))
 
         with self.assertRaises(Exception) as context:
             model = ORTModelForSeq2SeqLM.from_pretrained("optimum/t5-small")
@@ -68,6 +85,10 @@ class ORTDynamicQuantizationTest(unittest.TestCase):
         (ORTModelForSequenceClassification, "hf-internal-testing/tiny-random-roberta", 30),
         (ORTModelForSequenceClassification, "hf-internal-testing/tiny-random-distilbert", 30),
         (ORTModelForSequenceClassification, "hf-internal-testing/tiny-random-bart", 32),
+    )
+
+    SUPPORTED_DECODER_ARCHITECTURES_WITH_EXPECTED_QUANTIZED_MATMULS = (
+        (ORTModelForCausalLM, "hf-internal-testing/tiny-random-gpt2", 22),
     )
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_EXPECTED_QUANTIZED_MATMULS)
@@ -84,15 +105,11 @@ class ORTDynamicQuantizationTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir)
-            model = model_cls.from_pretrained(model_name, from_transformers=True)
+            model = model_cls.from_pretrained(model_name, export=True)
             model.save_pretrained(tmp_dir)
 
             quantizer = ORTQuantizer.from_pretrained(model)
-            quantizer.quantize(
-                save_dir=output_dir,
-                quantization_config=qconfig,
-            )
-
+            quantizer.quantize(save_dir=output_dir, quantization_config=qconfig)
             expected_ort_config = ORTConfig(quantization=qconfig)
             ort_config = ORTConfig.from_pretrained(tmp_dir)
             # Verify the ORTConfig was correctly created and saved
@@ -102,6 +119,60 @@ class ORTDynamicQuantizationTest(unittest.TestCase):
             num_quantized_matmul = 0
             for initializer in quantized_model.graph.initializer:
                 if "MatMul" in initializer.name and "quantized" in initializer.name:
+                    num_quantized_matmul += 1
+            self.assertEqual(expected_quantized_matmuls, num_quantized_matmul)
+            gc.collect()
+
+    # NOTE: Will be fixed in 1.17.1, reference: https://github.com/microsoft/onnxruntime/pull/19421
+    @unittest.skipIf(parse(ort_version) == Version("1.17.0"), "not supported with this onnxruntime version")
+    def test_dynamic_quantization_subgraphs(self):
+        qconfig = AutoQuantizationConfig.avx512(is_static=False, per_channel=True)
+        tmp_dir = tempfile.mkdtemp()
+        output_dir = Path(tmp_dir)
+        model = ORTModelForCausalLM.from_pretrained("fxmarty/onnx-tiny-random-gpt2-with-merge", use_merged=True)
+        self.assertTrue(model.use_merged)
+        model.save_pretrained(tmp_dir)
+
+        quantizer = ORTQuantizer.from_pretrained(model)
+        quantizer.quantize(save_dir=output_dir, quantization_config=qconfig)
+        expected_ort_config = ORTConfig(quantization=qconfig)
+        ort_config = ORTConfig.from_pretrained(tmp_dir)
+        # Verify the ORTConfig was correctly created and saved
+        self.assertEqual(ort_config.to_dict(), expected_ort_config.to_dict())
+
+        quantized_model = onnx_load(output_dir.joinpath("decoder_model_merged_quantized.onnx"))
+        num_quantized_matmul = 0
+        for initializer in quantized_model.graph.initializer:
+            if "weight" in initializer.name and "quantized" in initializer.name:
+                num_quantized_matmul += 1
+
+        self.assertTrue(num_quantized_matmul > 0)
+        gc.collect()
+
+    @parameterized.expand(
+        grid_parameters(
+            {"model_arch": SUPPORTED_DECODER_ARCHITECTURES_WITH_EXPECTED_QUANTIZED_MATMULS, "use_cache": [True, False]}
+        )
+    )
+    def test_decoder_quantization_with_and_without_cache(self, test_name, model_info, use_cache):
+        model_cls, model_name, expected_quantized_matmuls = model_info
+        qconfig = AutoQuantizationConfig.avx512(is_static=False, per_channel=True)
+        model = model_cls.from_pretrained(model_name, export=True, use_cache=use_cache, use_io_binding=use_cache)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            output_dir = Path(tmp_dir)
+            quantizer = ORTQuantizer.from_pretrained(model)
+            quantizer.quantize(save_dir=output_dir, quantization_config=qconfig)
+            expected_ort_config = ORTConfig(quantization=qconfig)
+            ort_config = ORTConfig.from_pretrained(tmp_dir)
+
+            # Verify the ORTConfig was correctly created and saved
+            self.assertEqual(ort_config.to_dict(), expected_ort_config.to_dict())
+            quantized_model = onnx_load(output_dir.joinpath("model_quantized.onnx"))
+            num_quantized_matmul = 0
+            for initializer in quantized_model.graph.initializer:
+                if "weight" in initializer.name and "quantized" in initializer.name:
                     num_quantized_matmul += 1
             self.assertEqual(expected_quantized_matmuls, num_quantized_matmul)
             gc.collect()
@@ -130,7 +201,7 @@ class ORTStaticQuantizationTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir)
-            model = model_cls.from_pretrained(model_name, from_transformers=True)
+            model = model_cls.from_pretrained(model_name, export=True)
             model.save_pretrained(tmp_dir)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -144,10 +215,7 @@ class ORTStaticQuantizationTest(unittest.TestCase):
                 dataset_split="train",
             )
             calibration_config = AutoCalibrationConfig.minmax(calibration_dataset)
-            ranges = quantizer.fit(
-                dataset=calibration_dataset,
-                calibration_config=calibration_config,
-            )
+            ranges = quantizer.fit(dataset=calibration_dataset, calibration_config=calibration_config)
             quantizer.quantize(
                 save_dir=output_dir,
                 calibration_tensors_range=ranges,

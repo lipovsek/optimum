@@ -13,48 +13,103 @@ except Exception as error:
 
 
 REQUIRED_PKGS = [
-    "coloredlogs",
-    "sympy",
-    "transformers[sentencepiece]>=4.20.1",
-    "torch>=1.9",
+    "transformers>=4.29",
+    "torch>=1.11",
     "packaging",
     "numpy",
     "huggingface_hub>=0.8.0",
 ]
 
-TESTS_REQUIRE = ["pytest", "requests", "parameterized", "pytest-xdist", "Pillow"]
+# TODO: unpin pytest once https://github.com/huggingface/transformers/pull/29154 is merged & released
+# pytest>=8.0.0 also fails with the transformers version pinned for exporters-tf
+TESTS_REQUIRE = [
+    "accelerate",
+    "pytest<=8.0.0",
+    "requests",
+    "parameterized",
+    "pytest-xdist",
+    "Pillow",
+    "sacremoses",
+    "torchvision",
+    "torchaudio",
+    "einops",
+    "timm",
+    "scikit-learn",
+    "sentencepiece",
+    "rjieba",
+]
 
-QUALITY_REQUIRE = ["black~=22.0", "flake8>=3.8.3", "isort>=5.5.4"]
+QUALITY_REQUIRE = ["black~=23.1", "ruff==0.1.5"]
 
 BENCHMARK_REQUIRE = ["optuna", "tqdm", "scikit-learn", "seqeval", "torchvision", "evaluate>=0.2.0"]
 
 EXTRAS_REQUIRE = {
     "onnxruntime": [
         "onnx",
-        "onnxruntime>=1.9.0",
+        "onnxruntime>=1.11.0",
         "datasets>=1.2.1",
         "evaluate",
-        "protobuf==3.20.1",
+        "protobuf>=3.20.1",
+        "transformers>=4.36,<4.49.0",
     ],
     "onnxruntime-gpu": [
         "onnx",
-        "onnxruntime-gpu>=1.9.0",
+        "onnxruntime-gpu>=1.11.0",
         "datasets>=1.2.1",
         "evaluate",
-        "protobuf==3.20.1",
+        "protobuf>=3.20.1",
+        "transformers>=4.36,<4.49.0",
     ],
-    "exporters": ["onnx", "onnxruntime", "timm"],
-    "exporters-tf": ["tensorflow>=2.4,<2.11", "tf2onnx", "onnx", "onnxruntime", "timm"],
-    "intel": "optimum-intel",
-    "openvino": "optimum-intel[openvino]",
-    "nncf": "optimum-intel[nncf]",
-    "neural-compressor": "optimum-intel[neural-compressor]",
+    "onnxruntime-training": [
+        "torch-ort",
+        "onnxruntime-training>=1.11.0",
+        "datasets>=1.2.1",
+        "accelerate",
+        "evaluate",
+        "protobuf>=3.20.1",
+        "transformers>=4.36,<4.49.0",
+    ],
+    "exporters": [
+        "onnx",
+        "onnxruntime",
+        "timm",
+        "transformers>=4.36,<4.49.0",
+    ],
+    "exporters-gpu": [
+        "onnx",
+        "onnxruntime-gpu",
+        "timm",
+        "transformers>=4.36,<4.49.0",
+    ],
+    "exporters-tf": [
+        "tensorflow>=2.4,<=2.12.1",
+        "tf2onnx",
+        "onnx",
+        "onnxruntime",
+        "timm",
+        "h5py",
+        "numpy<1.24.0",
+        "datasets<=2.16",
+        "transformers>=4.36,<4.38",
+    ],
+    "diffusers": ["diffusers"],
+    "intel": "optimum-intel>=1.18.0",
+    "openvino": "optimum-intel[openvino]>=1.18.0",
+    "nncf": "optimum-intel[nncf]>=1.18.0",
+    "neural-compressor": "optimum-intel[neural-compressor]>=1.18.0",
+    "ipex": "optimum-intel[ipex]>=1.18.0",
+    "habana": ["optimum-habana", "transformers>=4.45.0,<4.46.0"],
+    "neuron": ["optimum-neuron[neuron]>=0.0.20", "transformers>=4.36.2,<4.42.0"],
+    "neuronx": ["optimum-neuron[neuronx]>=0.0.20", "transformers>=4.36.2,<4.42.0"],
     "graphcore": "optimum-graphcore",
-    "habana": "optimum-habana",
+    "furiosa": "optimum-furiosa",
+    "amd": "optimum-amd",
+    "quanto": ["optimum-quanto>=0.2.4"],
     "dev": TESTS_REQUIRE + QUALITY_REQUIRE,
     "tests": TESTS_REQUIRE,
     "quality": QUALITY_REQUIRE,
     "benchmark": BENCHMARK_REQUIRE,
+    "doc-build": ["accelerate"],
 }
 
 setup(
@@ -72,9 +127,10 @@ setup(
         "Intended Audience :: Education",
         "Intended Audience :: Science/Research",
         "Operating System :: OS Independent",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     keywords="transformers, quantization, pruning, optimization, training, inference, onnx, onnx runtime, intel, "
@@ -86,7 +142,8 @@ setup(
     packages=find_namespace_packages(include=["optimum*"]),
     install_requires=REQUIRED_PKGS,
     extras_require=EXTRAS_REQUIRE,
-    python_requires=">=3.7.0",
+    python_requires=">=3.9.0",
     include_package_data=True,
     zip_safe=False,
+    entry_points={"console_scripts": ["optimum-cli=optimum.commands.optimum_cli:main"]},
 )

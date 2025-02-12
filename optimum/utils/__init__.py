@@ -11,71 +11,95 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import importlib.util
-import inspect
-from contextlib import contextmanager
-
-from packaging import version
 
 
-CONFIG_NAME = "config.json"
-
-_onnxruntime_available = importlib.util.find_spec("onnxruntime") is not None
-_pydantic_available = importlib.util.find_spec("pydantic") is not None
-_accelerate_available = importlib.util.find_spec("accelerate") is not None
-
-
-def is_onnxruntime_available():
-    try:
-        # Try to import the source file of onnxruntime - if you run the tests from `tests` the function gets
-        # confused since there a folder named `onnxruntime` in `tests`. Therefore, `_onnxruntime_available`
-        # will be set to `True` even if not installed.
-        mod = importlib.import_module("onnxruntime")
-        inspect.getsourcefile(mod)
-    except:
-        return False
-    return _onnxruntime_available
-
-
-def is_pydantic_available():
-    return _pydantic_available
-
-
-def is_accelerate_available():
-    return _accelerate_available
-
-
-@contextmanager
-def check_if_pytorch_greater(target_version: str, message: str):
-    r"""
-    A context manager that does nothing except checking if the PyTorch version is greater than `pt_version`
-    """
-    import torch
-
-    if not version.parse(torch.__version__) >= version.parse(target_version):
-        raise ImportError(
-            f"Found an incompatible version of PyTorch. Found version {torch.__version__}, but only {target_version} and above are supported. {message}"
-        )
-    try:
-        yield
-    finally:
-        pass
-
-
-from .input_generators import (  # noqa
+from .constant import (
+    CONFIG_NAME,
+    DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER,
+    DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER,
+    DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER,
+    DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER,
+    DIFFUSION_MODEL_UNET_SUBFOLDER,
+    DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER,
+    DIFFUSION_MODEL_VAE_ENCODER_SUBFOLDER,
+    ONNX_WEIGHTS_NAME,
+)
+from .import_utils import (
+    DIFFUSERS_MINIMUM_VERSION,
+    ORT_QUANTIZE_MINIMUM_VERSION,
+    TORCH_MINIMUM_VERSION,
+    TRANSFORMERS_MINIMUM_VERSION,
+    check_if_diffusers_greater,
+    check_if_pytorch_greater,
+    check_if_torch_greater,
+    check_if_transformers_greater,
+    is_accelerate_available,
+    is_auto_gptq_available,
+    is_datasets_available,
+    is_diffusers_available,
+    is_diffusers_version,
+    is_gptqmodel_available,
+    is_onnx_available,
+    is_onnxruntime_available,
+    is_pydantic_available,
+    is_sentence_transformers_available,
+    is_tf_available,
+    is_timm_available,
+    is_torch_available,
+    is_torch_onnx_support_available,
+    is_torch_version,
+    is_transformers_available,
+    is_transformers_version,
+    require_numpy_strictly_lower,
+)
+from .input_generators import (
+    DEFAULT_DUMMY_SHAPES,
+    DTYPE_MAPPER,
+    BloomDummyPastKeyValuesGenerator,
     DummyAudioInputGenerator,
     DummyBboxInputGenerator,
+    DummyCodegenDecoderTextInputGenerator,
+    DummyDecisionTransformerInputGenerator,
     DummyDecoderTextInputGenerator,
+    DummyEncodecInputGenerator,
+    DummyFluxTransformerTextInputGenerator,
+    DummyFluxTransformerVisionInputGenerator,
+    DummyInputGenerator,
+    DummyIntGenerator,
+    DummyLabelsGenerator,
     DummyPastKeyValuesGenerator,
+    DummyPatchTSTInputGenerator,
+    DummyPix2StructInputGenerator,
+    DummyPointsGenerator,
     DummySeq2SeqDecoderTextInputGenerator,
     DummySeq2SeqPastKeyValuesGenerator,
+    DummySpeechT5InputGenerator,
     DummyTextInputGenerator,
+    DummyTimestepInputGenerator,
+    DummyTransformerTextInputGenerator,
+    DummyTransformerTimestepInputGenerator,
+    DummyTransformerVisionInputGenerator,
+    DummyVisionEmbeddingsGenerator,
+    DummyVisionEncoderDecoderPastKeyValuesGenerator,
     DummyVisionInputGenerator,
+    DummyXPathSeqInputGenerator,
+    FalconDummyPastKeyValuesGenerator,
+    GemmaDummyPastKeyValuesGenerator,
+    GPTBigCodeDummyPastKeyValuesGenerator,
+    LongformerDummyTextInputGenerator,
+    MCTCTDummyAudioInputGenerator,
+    MistralDummyPastKeyValuesGenerator,
+    MultiQueryPastKeyValuesGenerator,
 )
-from .normalized_config import (  # noqa
+from .modeling_utils import recurse_getattr, recurse_setattr
+from .normalized_config import (
     NormalizedConfig,
+    NormalizedConfigManager,
+    NormalizedEncoderDecoderConfig,
     NormalizedSeq2SeqConfig,
     NormalizedTextAndVisionConfig,
     NormalizedTextConfig,
+    NormalizedTextConfigWithGQA,
+    NormalizedTimeSeriesForecastingConfig,
     NormalizedVisionConfig,
 )

@@ -4,85 +4,128 @@ Optimum is a utility package for building and running inference with accelerated
 Optimum can be used to load optimized models from the [Hugging Face Hub](hf.co/models) and create pipelines
 to run accelerated inference without rewriting your APIs.
 
-## Switching from Transformers to Optimum Inference
 
-The Optimum Inference models are API compatible with Hugging Face Transformers models. This means you can just replace your `AutoModelForXxx` class with the corresponding `ORTModelForXxx` class in `optimum`. For example, this is how you can use a question answering model in `optimum`:
+## Loading
+
+### Transformers models
+
+Once your model was [exported to the ONNX format](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model), you can load it by replacing `AutoModelForXxx` with the corresponding `ORTModelForXxx` class.
 
 ```diff
-from transformers import AutoTokenizer, pipeline
--from transformers import AutoModelForQuestionAnswering
-+from optimum.onnxruntime import ORTModelForQuestionAnswering
+  from transformers import AutoTokenizer, pipeline
+- from transformers import AutoModelForCausalLM
++ from optimum.onnxruntime import ORTModelForCausalLM
 
--model = AutoModelForQuestionAnswering.from_pretrained("deepset/roberta-base-squad2") # pytorch checkpoint
-+model = ORTModelForQuestionAnswering.from_pretrained("optimum/roberta-base-squad2") # onnx checkpoint
-tokenizer = AutoTokenizer.from_pretrained("deepset/roberta-base-squad2")
+- model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B") # PyTorch checkpoint
++ model = ORTModelForCausalLM.from_pretrained("onnx-community/Llama-3.2-1B", subfolder="onnx") # ONNX checkpoint
+  tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 
-onnx_qa = pipeline("question-answering",model=model,tokenizer=tokenizer)
-
-question = "What's my name?"
-context = "My name is Philipp and I live in Nuremberg."
-pred = onnx_qa(question, context)
+  pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+  result = pipe("He never went out without a book under his arm")
 ```
 
-Optimum Inference also includes methods to convert vanilla Transformers models to optimized ones. Simply pass `from_transformers=True` to the `from_pretrained()` method, and your model will be loaded and converted to ONNX on-the-fly:
+More information for all the supported `ORTModelForXxx` in our [documentation](https://huggingface.co/docs/optimum/onnxruntime/package_reference/modeling_ort)
 
-```python
->>> from transformers import AutoTokenizer, pipeline
->>> from optimum.onnxruntime import ORTModelForSequenceClassification
 
-# Load the model from the hub and export it to the ONNX format
->>> model = ORTModelForSequenceClassification.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english", from_transformers=True)
->>> tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
+### Diffusers models
 
-# Create a pipeline
->>> onnx_classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+Once your model was [exported to the ONNX format](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model), you can load it by replacing `DiffusionPipeline` with the corresponding `ORTDiffusionPipeline` class.
 
->>> result = onnx_classifier("This is a great model")
-[{'label': 'POSITIVE', 'score': 0.9998838901519775}]
+
+```diff
+- from diffusers import DiffusionPipeline
++ from optimum.onnxruntime import ORTDiffusionPipeline
+
+  model_id = "runwayml/stable-diffusion-v1-5"
+- pipeline = DiffusionPipeline.from_pretrained(model_id)
++ pipeline = ORTDiffusionPipeline.from_pretrained(model_id, revision="onnx")
+  prompt = "sailing ship in storm by Leonardo da Vinci"
+  image = pipeline(prompt).images[0]
 ```
 
-### Working with the Hugging Face Model Hub
 
-The Optimum model classes like [`~onnxruntime.ORTModelForSequenceClassification`] are integrated with the [Hugging Face Model Hub](https://hf.co/models), which means you can not only
-load model from the Hub, but also push your models to the Hub with `push_to_hub()` method. Below is an example which downloads a vanilla Transformers model
-from the Hub and converts it to an optimum onnxruntime model and pushes it back into a new repository.
+### Sentence Transformers models
 
-<!-- TODO: Add Quantizer into example when UX improved -->
+Once your model was [exported to the ONNX format](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model), you can load it by replacing `AutoModel` with the corresponding `ORTModelForFeatureExtraction` class.
+
+```diff
+  from transformers import AutoTokenizer
+- from transformers import AutoModel
++ from optimum.onnxruntime import ORTModelForFeatureExtraction
+
+  tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+- model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
++ model = ORTModelForFeatureExtraction.from_pretrained("optimum/all-MiniLM-L6-v2")
+  inputs = tokenizer("This is an example sentence", return_tensors="pt")
+  outputs = model(**inputs)
+```
+
+You can also load your ONNX model directly using the [`sentence_transformers.SentenceTransformer`](https://sbert.net/docs/sentence_transformer/usage/efficiency.html#onnx) class, just make sure to have `sentence-transformers>=3.2` installed. If the model wasn't already converted to ONNX, it will be converted automatically on-the-fly.
+
+```diff
+  from sentence_transformers import SentenceTransformer
+
+  model_id = "sentence-transformers/all-MiniLM-L6-v2"
+- model = SentenceTransformer(model_id)
++ model = SentenceTransformer(model_id, backend="onnx")
+
+  sentences = ["This is an example sentence", "Each sentence is converted"]
+  embeddings = model.encode(sentences)
+```
+
+
+### Timm models
+
+Once your model was [exported to the ONNX format](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model), you can load it by replacing the `create_model` with the corresponding `ORTModelForImageClassification` class.
+
+
+```diff
+  import requests
+  from PIL import Image
+- from timm import create_model
+  from timm.data import resolve_data_config, create_transform
++ from optimum.onnxruntime import ORTModelForImageClassification
+
+- model = create_model("timm/mobilenetv3_large_100.ra_in1k", pretrained=True)
++ model = ORTModelForImageClassification.from_pretrained("optimum/mobilenetv3_large_100.ra_in1k")
+  transform = create_transform(**resolve_data_config(model.config.pretrained_cfg, model=model))
+  url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/beignets-task-guide.png"
+  image = Image.open(requests.get(url, stream=True).raw)
+  inputs = transform(image).unsqueeze(0)
+  outputs = model(inputs)
+```
+
+
+
+## Converting your model to ONNX on-the-fly
+
+In case your model wasn't already [converted to ONNX](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model), [`~optimum.onnxruntime.ORTModel`] includes a method to convert your model to ONNX on-the-fly.
+Simply pass `export=True` to the [`~optimum.onnxruntime.ORTModel.from_pretrained`] method, and your model will be loaded and converted to ONNX on-the-fly:
+
 ```python
->>> from transformers import AutoTokenizer
 >>> from optimum.onnxruntime import ORTModelForSequenceClassification
 
-# Load the model from the hub and export it to the ONNX format
->>> model = ORTModelForSequenceClassification.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english", from_transformers=True)
->>> tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
+>>> # Load the model from the hub and export it to the ONNX format
+>>> model_id = "distilbert-base-uncased-finetuned-sst-2-english"
+>>> model = ORTModelForSequenceClassification.from_pretrained(model_id, export=True)
+```
 
-# Save the converted model
->>> model.save_pretrained("a_local_path_for_convert_onnx_model")
->>> tokenizer.save_pretrained("a_local_path_for_convert_onnx_model")
+
+## Pushing your model to the Hub
+
+You can also call `push_to_hub` directly on your model to upload it to the [Hub](https://hf.co/models).
+
+```python
+>>> from optimum.onnxruntime import ORTModelForSequenceClassification
+
+>>> # Load the model from the hub and export it to the ONNX format
+>>> model_id = "distilbert-base-uncased-finetuned-sst-2-english"
+>>> model = ORTModelForSequenceClassification.from_pretrained(model_id, export=True)
+
+>>> # Save the converted model locally
+>>> output_dir = "a_local_path_for_convert_onnx_model"
+>>> model.save_pretrained(output_dir)
 
 # Push the onnx model to HF Hub
->>> model.push_to_hub("a_local_path_for_convert_onnx_model", repository_id="my-onnx-repo", use_auth_token=True)
-```
-
-## Export and inference of sequence-to-sequence models
-
-Sequence-to-sequence (Seq2Seq) models, that generate a new sequence from an input, can also be used when running inference with ONNX Runtime. When Seq2Seq models are exported to the ONNX format, they are decomposed into three parts that are later combined during inference.
-Those three parts consist of the encoder, the "decoder" (which actually consists of the decoder with the language modeling head), and the "decoder" with pre-computed key/values as additional inputs.
-This specific export comes from the fact that during the first pass, the decoder has no pre-computed key/values hidden-states, while during the rest of the generation past key/values will be used to speed up sequential decoding.
-Here is an example on how you can export a T5 model to the ONNX format and run inference for a translation task:
-
-
-```python
->>> from transformers import AutoTokenizer, pipeline
->>> from optimum.onnxruntime import ORTModelForSeq2SeqLM
-
-# Load the model from the hub and export it to the ONNX format
->>> model = ORTModelForSeq2SeqLM.from_pretrained("t5-small", from_transformers=True)
->>> tokenizer = AutoTokenizer.from_pretrained("t5-small")
-
-# Create a pipeline
->>> onnx_translation = pipeline("translation_en_to_fr", model=model, tokenizer=tokenizer)
-
->>> result = onnx_translation("My name is Eustache")
-[{'translation_text': 'Mon nom est Eustache'}]
+>>> model.push_to_hub(output_dir, repository_id="my-onnx-repo")  # doctest: +SKIP
 ```

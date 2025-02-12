@@ -24,22 +24,20 @@ import os
 import sys
 from dataclasses import dataclass, field
 from functools import partial
-from pathlib import Path
 from typing import Optional
 
 import datasets
 import transformers
 from datasets import load_dataset
-from transformers import AutoTokenizer, EvalPrediction, HfArgumentParser, PreTrainedTokenizer, TrainingArguments
-from transformers.onnx import FeaturesManager
-from transformers.utils import check_min_version
-from transformers.utils.versions import require_version
-
 from evaluate import load
 from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
+from transformers import AutoTokenizer, EvalPrediction, HfArgumentParser, PreTrainedTokenizer, TrainingArguments
+from transformers.utils import check_min_version
+from transformers.utils.versions import require_version
+from utils_qa import postprocess_qa_predictions
+
 from optimum.onnxruntime import ORTQuantizer
 from optimum.onnxruntime.configuration import AutoCalibrationConfig, QuantizationConfig
-from optimum.onnxruntime.model import ORTModel
 from optimum.onnxruntime.modeling_ort import ORTModelForQuestionAnswering
 from optimum.onnxruntime.preprocessors import QuantizationPreprocessor
 from optimum.onnxruntime.preprocessors.passes import (
@@ -48,8 +46,7 @@ from optimum.onnxruntime.preprocessors.passes import (
     ExcludeNodeAfter,
     ExcludeNodeFollowedBy,
 )
-from trainer_qa import QuestionAnsweringTrainer
-from utils_qa import postprocess_qa_predictions
+from optimum.onnxruntime.utils import evaluation_loop
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -539,7 +536,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
     # Export the model
-    model = ORTModelForQuestionAnswering.from_pretrained(model_args.model_name_or_path, from_transformers=True)
+    model = ORTModelForQuestionAnswering.from_pretrained(model_args.model_name_or_path, export=True)
 
     # Create the quantizer
     quantizer = ORTQuantizer.from_pretrained(model)
@@ -653,47 +650,46 @@ def main():
         quantization_preprocessor.register_pass(ExcludeNodeFollowedBy("Add", "Softmax"))
 
     # Apply quantization on the model
-    quantizer.quantize(
+    quantized_model_path = quantizer.quantize(
         save_dir=training_args.output_dir,
         calibration_tensors_range=ranges,
         quantization_config=qconfig,
         preprocessor=quantization_preprocessor,
         use_external_data_format=onnx_export_args.use_external_data_format,
     )
+    model = ORTModelForQuestionAnswering.from_pretrained(quantized_model_path, provider=optim_args.execution_provider)
 
     # Evaluation
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
-        ort_model = ORTModel(
-            Path(training_args.output_dir) / "model_quantized.onnx",
-            execution_provider=optim_args.execution_provider,
+        outputs = evaluation_loop(
+            model=model,
+            dataset=eval_dataset,
             compute_metrics=compute_metrics,
             label_names=["start_positions", "end_positions"],
         )
-        outputs = ort_model.evaluation_loop(eval_dataset)
         predictions = post_processing_function(eval_examples, eval_dataset, outputs.predictions)
         metrics = compute_metrics(predictions)
 
         # Save metrics
-        with open(os.path.join(training_args.output_dir, f"eval_results.json"), "w") as f:
+        with open(os.path.join(training_args.output_dir, "eval_results.json"), "w") as f:
             json.dump(metrics, f, indent=4, sort_keys=True)
 
     # Prediction
     if training_args.do_predict:
         logger.info("*** Predict ***")
 
-        ort_model = ORTModel(
-            Path(training_args.output_dir) / "model_quantized.onnx",
-            execution_provider=optim_args.execution_provider,
+        outputs = evaluation_loop(
+            model=model,
+            dataset=predict_dataset,
             label_names=["start_positions", "end_positions"],
         )
-        outputs = ort_model.evaluation_loop(predict_dataset)
         predictions = post_processing_function(predict_examples, predict_dataset, outputs.predictions)
         metrics = compute_metrics(predictions)
 
         # Save metrics
-        with open(os.path.join(training_args.output_dir, f"predict_results.json"), "w") as f:
+        with open(os.path.join(training_args.output_dir, "predict_results.json"), "w") as f:
             json.dump(metrics, f, indent=4, sort_keys=True)
 
 

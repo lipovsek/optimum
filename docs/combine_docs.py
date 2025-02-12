@@ -1,9 +1,12 @@
 import argparse
 import shutil
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import yaml
+
+
+SUBPACKAGE_TOC_INSERT_INDEX = 2
 
 
 parser = argparse.ArgumentParser(
@@ -20,7 +23,7 @@ parser.add_argument("--version", type=str, default="main", help="The version of 
 
 def rename_subpackage_toc(subpackage: str, toc: Dict):
     """
-    Extend table of contents sections with the subpackage name as the parent folder.
+    Extends table of contents sections with the subpackage name as the parent folder.
 
     Args:
         subpackage (str): subpackage name.
@@ -80,36 +83,109 @@ def rename_copy_subpackage_html_paths(subpackage: str, subpackage_path: Path, op
         shutil.copyfile(html_path, new_path_in_optimum)
 
 
+def add_neuron_doc(base_toc: List):
+    """
+    Extends the table of content with a section about Optimum Neuron.
+
+    Args:
+        base_toc (List): table of content for the doc of Optimum.
+    """
+    # Update optimum table of contents
+    base_toc.insert(
+        SUBPACKAGE_TOC_INSERT_INDEX,
+        {
+            "sections": [
+                {
+                    # Ideally this should directly point at https://huggingface.co/docs/optimum-neuron/index
+                    # Current hacky solution is to have a redirection in _redirects.yml
+                    "local": "docs/optimum-neuron/index",
+                    "title": "🤗 Optimum Neuron",
+                }
+            ],
+            "title": "AWS Trainium/Inferentia",
+            "isExpanded": False,
+        },
+    )
+
+
+def add_tpu_doc(base_toc: List):
+    """
+    Extends the table of content with a section about Optimum TPU.
+
+    Args:
+        base_toc (List): table of content for the doc of Optimum.
+    """
+    # Update optimum table of contents
+    base_toc.insert(
+        SUBPACKAGE_TOC_INSERT_INDEX,
+        {
+            "sections": [
+                {
+                    # Ideally this should directly point at https://huggingface.co/docs/optimum-tpu/index
+                    # Current hacky solution is to have a redirection in _redirects.yml
+                    "local": "docs/optimum-tpu/index",
+                    "title": "🤗 Optimum-TPU",
+                }
+            ],
+            "title": "Google TPUs",
+            "isExpanded": False,
+        },
+    )
+
+
 def main():
     args = parser.parse_args()
     optimum_path = Path("optimum-doc-build")
+    # Load optimum table of contents
+    base_toc_path = next(optimum_path.rglob("_toctree.yml"))
+    with open(base_toc_path, "r") as f:
+        base_toc = yaml.safe_load(f)
 
     # Copy and rename all files from subpackages' docs to Optimum doc
-    for subpackage in args.subpackages:
-        subpackage_path = Path(f"{subpackage}-doc-build")
+    for subpackage in args.subpackages[::-1]:
+        if subpackage == "neuron":
+            # Neuron has its own doc so it is managed differently
+            add_neuron_doc(base_toc)
+        elif subpackage == "tpu":
+            # Optimum TPU has its own doc so it is managed differently
+            add_tpu_doc(base_toc)
+        elif subpackage == "nvidia":
+            # At the moment, Optimum Nvidia's doc is the README of the GitHub repo
+            # It is linked to in optimum/docs/source/nvidia_overview.mdx
+            continue
+        else:
+            subpackage_path = Path(f"{subpackage}-doc-build")
 
-        # Copy all HTML files from subpackage into optimum
-        rename_copy_subpackage_html_paths(
-            subpackage,
-            subpackage_path,
-            optimum_path,
-            args.version,
-        )
+            # The doc of Furiosa will be missing for PRs
+            if subpackage == "furiosa" and not subpackage_path.is_dir():
+                continue
 
-        # Load optimum table of contents
-        base_toc_path = next(optimum_path.rglob("_toctree.yml"))
-        with open(base_toc_path, "r") as f:
-            base_toc = yaml.safe_load(f)
-        # Load subpackage table of contents
-        subpackage_toc_path = next(subpackage_path.rglob("_toctree.yml"))
-        with open(subpackage_toc_path, "r") as f:
-            subpackage_toc = yaml.safe_load(f)
-        # Extend table of contents sections with the subpackage name as the parent folder
-        rename_subpackage_toc(subpackage, subpackage_toc)
-        # Update optimum table of contents
-        base_toc.extend(subpackage_toc)
-        with open(base_toc_path, "w") as f:
-            yaml.safe_dump(base_toc, f, allow_unicode=True)
+            # Copy all HTML files from subpackage into optimum
+            rename_copy_subpackage_html_paths(
+                subpackage,
+                subpackage_path,
+                optimum_path,
+                args.version,
+            )
+
+            # Load subpackage table of contents
+            subpackage_toc_path = next(subpackage_path.rglob("_toctree.yml"))
+            with open(subpackage_toc_path, "r") as f:
+                subpackage_toc = yaml.safe_load(f)
+            # Extend table of contents sections with the subpackage name as the parent folder
+            rename_subpackage_toc(subpackage, subpackage_toc)
+            # Just keep the name of the partner in the TOC title
+            if subpackage == "amd":
+                subpackage_toc[0]["title"] = subpackage_toc[0]["title"].split("Optimum-")[-1]
+            else:
+                subpackage_toc[0]["title"] = subpackage_toc[0]["title"].split("Optimum ")[-1]
+            if subpackage != "graphcore":
+                # Update optimum table of contents
+                base_toc.insert(SUBPACKAGE_TOC_INSERT_INDEX, subpackage_toc[0])
+
+    # Write final table of contents
+    with open(base_toc_path, "w") as f:
+        yaml.safe_dump(base_toc, f, allow_unicode=True)
 
 
 if __name__ == "__main__":

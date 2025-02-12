@@ -2,36 +2,7 @@
 
 # Hugging Face Optimum
 
-🤗 Optimum is an extension of 🤗 Transformers, providing a set of performance optimization tools enabling maximum efficiency to train and run models on targeted hardware.
-
-The AI ecosystem evolves quickly and more and more specialized hardware along with their own optimizations are emerging every day.
-As such, Optimum enables users to efficiently use any of these platforms with the same ease inherent to transformers.
-
-
-## Integration with Hardware Partners
-
-🤗 Optimum aims at providing more diversity towards the kind of hardware users can target to train and finetune their models.
-
-To achieve this, we are collaborating with the following hardware manufacturers in order to provide the best transformers integration:
-- [Graphcore IPUs](https://github.com/huggingface/optimum-graphcore) - IPUs are a completely new kind of massively parallel processor to accelerate machine intelligence. More information [here](https://www.graphcore.ai/products/ipu).
-- [Habana Gaudi Processor (HPU)](https://github.com/huggingface/optimum-habana) - [HPUs](https://docs.habana.ai/en/latest/Gaudi_Overview/Gaudi_Architecture.html) are designed to maximize training throughput and efficiency. More information [here](https://habana.ai/training/).
-- [Intel](https://github.com/huggingface/optimum-intel) - Enabling the usage of Intel tools to accelerate end-to-end pipelines on Intel architectures. More information about [Neural Compressor](https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html) and [OpenVINO](https://docs.openvino.ai/latest/index.html).
-- More to come soon! :star:
-
-## Optimizing models towards inference
-
-Along with supporting dedicated AI hardware for training, Optimum also provides inference optimizations towards various frameworks and
-platforms.
-
-Optimum enables the usage of popular compression techniques such as quantization and pruning by supporting [ONNX Runtime](https://onnxruntime.ai/docs/) along with [Intel Neural Compressor](https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html).
-
-| Features                           | ONNX Runtime          | Intel Neural Compressor |
-|:----------------------------------:|:---------------------:|:-----------------------:|
-| Post-training Dynamic Quantization |  :heavy_check_mark:   |    :heavy_check_mark:   |
-| Post-training Static Quantization  |  :heavy_check_mark:   |    :heavy_check_mark:   |
-| Quantization Aware Training (QAT)  |  Stay tuned! :star:   |    :heavy_check_mark:   |
-| Pruning                            |        N/A            |    :heavy_check_mark:   |
-
+🤗 Optimum is an extension of 🤗 Transformers and Diffusers, providing a set of optimization tools enabling maximum efficiency to train and run models on targeted hardware, while keeping things easy to use.
 
 ## Installation
 
@@ -43,73 +14,196 @@ python -m pip install optimum
 
 If you'd like to use the accelerator-specific features of 🤗 Optimum, you can install the required dependencies according to the table below:
 
-| Accelerator                                                                                                            | Installation                                      |
-|:-----------------------------------------------------------------------------------------------------------------------|:--------------------------------------------------|
-| [ONNX Runtime](https://onnxruntime.ai/docs/)                                                                           | `python -m pip install optimum[onnxruntime]`      |
-| [Intel Neural Compressor](https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html)       | `python -m pip install optimum[neural-compressor]`|
-| [OpenVINO](https://docs.openvino.ai/latest/index.html)                                                                 | `python -m pip install optimum[openvino,nncf]`    |
-| [Graphcore IPU](https://www.graphcore.ai/products/ipu)                                                                 | `python -m pip install optimum[graphcore]`        |
-| [Habana Gaudi Processor (HPU)](https://habana.ai/training/)                                                            | `python -m pip install optimum[habana]`           |
+| Accelerator                                                                                                            | Installation                                                      |
+|:-----------------------------------------------------------------------------------------------------------------------|:------------------------------------------------------------------|
+| [ONNX Runtime](https://huggingface.co/docs/optimum/onnxruntime/overview)                                               | `pip install --upgrade --upgrade-strategy eager optimum[onnxruntime]`      |
+| [Intel Neural Compressor](https://huggingface.co/docs/optimum/intel/index)                                             | `pip install --upgrade --upgrade-strategy eager optimum[neural-compressor]`|
+| [OpenVINO](https://huggingface.co/docs/optimum/intel/index)                                                            | `pip install --upgrade --upgrade-strategy eager optimum[openvino]`         |
+| [NVIDIA TensorRT-LLM](https://huggingface.co/docs/optimum/main/en/nvidia_overview)                                     | `docker run -it --gpus all --ipc host huggingface/optimum-nvidia`          |
+| [AMD Instinct GPUs and Ryzen AI NPU](https://huggingface.co/docs/optimum/amd/index)                                    | `pip install --upgrade --upgrade-strategy eager optimum[amd]`              |
+| [AWS Trainum & Inferentia](https://huggingface.co/docs/optimum-neuron/index)                                           | `pip install --upgrade --upgrade-strategy eager optimum[neuronx]`          |
+| [Habana Gaudi Processor (HPU)](https://huggingface.co/docs/optimum/habana/index)                                       | `pip install --upgrade --upgrade-strategy eager optimum[habana]`           |
+| [FuriosaAI](https://huggingface.co/docs/optimum/furiosa/index)                                                         | `pip install --upgrade --upgrade-strategy eager optimum[furiosa]`          |
 
+The `--upgrade --upgrade-strategy eager` option is needed to ensure the different packages are upgraded to the latest possible version.
 
-If you'd like to play with the examples or need the bleeding edge of the code and can't wait for a new release, you can install the base library from source as follows:
+To install from source:
 
 ```bash
 python -m pip install git+https://github.com/huggingface/optimum.git
 ```
 
-For the accelerator-specific features, you can install them by appending `#egg=optimum[accelerator_type]` to the `pip` command, e.g.
+For the accelerator-specific features, append `optimum[accelerator_type]` to the above command:
 
 ```bash
-python -m pip install git+https://github.com/huggingface/optimum.git#egg=optimum[onnxruntime]
+python -m pip install optimum[onnxruntime]@git+https://github.com/huggingface/optimum.git
 ```
 
-## Quick tour
+## Accelerated Inference
 
-Check out the examples below to see how 🤗 Optimum can be used to train and run inference on various hardware accelerators.
+🤗 Optimum provides multiple tools to export and run optimized models on various ecosystems:
 
-### Accelerated training
+- [ONNX](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model) / [ONNX Runtime](https://huggingface.co/docs/optimum/onnxruntime/usage_guides/models)
+- TensorFlow Lite
+- [OpenVINO](https://huggingface.co/docs/optimum/intel/inference)
+- Habana first-gen Gaudi / Gaudi2, more details [here](https://huggingface.co/docs/optimum/main/en/habana/usage_guides/accelerate_inference)
+- AWS Inferentia 2 / Inferentia 1, more details [here](https://huggingface.co/docs/optimum-neuron/en/guides/models)
+- NVIDIA TensorRT-LLM , more details [here](https://huggingface.co/blog/optimum-nvidia)
 
-#### Optimum Graphcore
+The [export](https://huggingface.co/docs/optimum/exporters/overview) and optimizations can be done both programmatically and with a command line.
 
-To train transformers on Graphcore's IPUs, 🤗 Optimum provides a `IPUTrainer` that is very similar to the [🤗 Transformers trainer](https://huggingface.co/docs/transformers/main_classes/trainer). Here is a simple example:
+### Features summary
+
+| Features                           | [ONNX Runtime](https://huggingface.co/docs/optimum/main/en/onnxruntime/overview)| [Neural Compressor](https://huggingface.co/docs/optimum/main/en/intel/optimization_inc)| [OpenVINO](https://huggingface.co/docs/optimum/main/en/intel/inference)| [TensorFlow Lite](https://huggingface.co/docs/optimum/main/en/exporters/tflite/overview)|
+|:----------------------------------:|:------------------:|:------------------:|:------------------:|:------------------:|
+| Graph optimization                 | :heavy_check_mark: | N/A                | :heavy_check_mark: | N/A                |
+| Post-training dynamic quantization | :heavy_check_mark: | :heavy_check_mark: | N/A                | :heavy_check_mark: |
+| Post-training static quantization  | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: | :heavy_check_mark: |
+| Quantization Aware Training (QAT)  | N/A                | :heavy_check_mark: | :heavy_check_mark: | N/A                |
+| FP16 (half precision)              | :heavy_check_mark: | N/A                | :heavy_check_mark: | :heavy_check_mark: |
+| Pruning                            | N/A                | :heavy_check_mark: | :heavy_check_mark: | N/A                |
+| Knowledge Distillation             | N/A                | :heavy_check_mark: | :heavy_check_mark: | N/A                |
+
+
+### OpenVINO
+
+Before you begin, make sure you have all the necessary libraries installed :
+
+```bash
+pip install --upgrade --upgrade-strategy eager optimum[openvino]
+```
+
+It is possible to export 🤗 Transformers and Diffusers models to the OpenVINO format easily:
+
+```bash
+optimum-cli export openvino --model distilbert-base-uncased-finetuned-sst-2-english distilbert_sst2_ov
+```
+
+If you add `--weight-format int8`, the weights will be quantized to `int8`, check out our [documentation](https://huggingface.co/docs/optimum/main/intel/openvino/export) for more detail. To apply quantization on both weights and activations, you can find more information [here](https://huggingface.co/docs/optimum/main/intel/openvino/optimization#static-quantization).
+
+To load a model and run inference with OpenVINO Runtime, you can just replace your `AutoModelForXxx` class with the corresponding `OVModelForXxx` class. To load a PyTorch checkpoint and convert it to the OpenVINO format on-the-fly, you can set `export=True` when loading your model.
 
 ```diff
-- from transformers import Trainer, TrainingArguments
-+ from optimum.graphcore import IPUConfig, IPUTrainer, IPUTrainingArguments
+- from transformers import AutoModelForSequenceClassification
++ from optimum.intel import OVModelForSequenceClassification
+  from transformers import AutoTokenizer, pipeline
 
-  # Download a pretrained model from the Hub
-  model = AutoModelForXxx.from_pretrained("bert-base-uncased")
+  model_id = "distilbert-base-uncased-finetuned-sst-2-english"
+  tokenizer = AutoTokenizer.from_pretrained(model_id)
+- model = AutoModelForSequenceClassification.from_pretrained(model_id)
++ model = OVModelForSequenceClassification.from_pretrained(model_id, export=True)
 
-  # Define the training arguments
-- training_args = TrainingArguments(
-+ training_args = IPUTrainingArguments(
-      output_dir="path/to/save/folder/",
-+     ipu_config_name="Graphcore/bert-base-ipu", # Any IPUConfig on the Hub or stored locally
-      ...
-  )
-
-  # Define the configuration to compile and put the model on the IPU
-+ ipu_config = IPUConfig.from_pretrained(training_args.ipu_config_name)
-
-  # Initialize the trainer
-- trainer = Trainer(
-+ trainer = IPUTrainer(
-      model=model,
-+     ipu_config=ipu_config
-      args=training_args,
-      train_dataset=train_dataset
-      ...
-  )
-
-  # Use Graphcore IPU for training!
-  trainer.train()
+  classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+  results = classifier("He's a dreadful magician.")
 ```
 
+You can find more examples in the [documentation](https://huggingface.co/docs/optimum/main/intel/openvino/inference) and in the [examples](https://github.com/huggingface/optimum-intel/tree/main/examples/openvino).
 
-#### Optimum Habana
+### Neural Compressor
 
-To train transformers on Habana's Gaudi processors, 🤗 Optimum provides a `GaudiTrainer` that is very similar to the [🤗 Transformers trainer](https://huggingface.co/docs/transformers/main_classes/trainer). Here is a simple example:
+Before you begin, make sure you have all the necessary libraries installed :
+
+```bash
+pip install --upgrade --upgrade-strategy eager optimum[neural-compressor]
+```
+
+Dynamic quantization can be applied on your model:
+
+```bash
+optimum-cli inc quantize --model distilbert-base-cased-distilled-squad --output ./quantized_distilbert
+```
+
+To load a model quantized with Intel Neural Compressor, hosted locally or on the 🤗 hub, you can do as follows :
+```python
+from optimum.intel import INCModelForSequenceClassification
+
+model_id = "Intel/distilbert-base-uncased-finetuned-sst-2-english-int8-dynamic"
+model = INCModelForSequenceClassification.from_pretrained(model_id)
+```
+
+You can find more examples in the [documentation](https://huggingface.co/docs/optimum/intel/optimization_inc) and in the [examples](https://github.com/huggingface/optimum-intel/tree/main/examples/neural_compressor).
+
+### ONNX + ONNX Runtime
+
+Before you begin, make sure you have all the necessary libraries installed :
+
+```bash
+pip install optimum[exporters,onnxruntime]
+```
+
+It is possible to export 🤗 Transformers and Diffusers models to the [ONNX](https://onnx.ai/) format and perform graph optimization as well as quantization easily:
+
+```plain
+optimum-cli export onnx -m deepset/roberta-base-squad2 --optimize O2 roberta_base_qa_onnx
+```
+
+The model can then be quantized using `onnxruntime`:
+
+```bash
+optimum-cli onnxruntime quantize \
+  --avx512 \
+  --onnx_model roberta_base_qa_onnx \
+  -o quantized_roberta_base_qa_onnx
+```
+
+These commands will export `deepset/roberta-base-squad2` and perform [O2 graph optimization](https://huggingface.co/docs/optimum/onnxruntime/usage_guides/optimization#optimization-configuration) on the exported model, and finally quantize it with the [avx512 configuration](https://huggingface.co/docs/optimum/main/en/onnxruntime/package_reference/configuration#optimum.onnxruntime.AutoQuantizationConfig.avx512).
+
+For more information on the ONNX export, please check the [documentation](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model).
+
+#### Run the exported model using ONNX Runtime
+
+Once the model is exported to the ONNX format, we provide Python classes enabling you to run the exported ONNX model in a seemless manner using [ONNX Runtime](https://onnxruntime.ai/) in the backend:
+
+```diff
+- from transformers import AutoModelForQuestionAnswering
++ from optimum.onnxruntime import ORTModelForQuestionAnswering
+  from transformers import AutoTokenizer, pipeline
+
+  model_id = "deepset/roberta-base-squad2"
+  tokenizer = AutoTokenizer.from_pretrained(model_id)
+- model = AutoModelForQuestionAnswering.from_pretrained(model_id)
++ model = ORTModelForQuestionAnswering.from_pretrained("roberta_base_qa_onnx")
+  qa_pipe = pipeline("question-answering", model=model, tokenizer=tokenizer)
+  question = "What's Optimum?"
+  context = "Optimum is an awesome library everyone should use!"
+  results = qa_pipe(question=question, context=context)
+```
+
+More details on how to run ONNX models with `ORTModelForXXX` classes [here](https://huggingface.co/docs/optimum/main/en/onnxruntime/usage_guides/models).
+
+### TensorFlow Lite
+
+Before you begin, make sure you have all the necessary libraries installed :
+
+```bash
+pip install optimum[exporters-tf]
+```
+
+Just as for ONNX, it is possible to export models to [TensorFlow Lite](https://www.tensorflow.org/lite) and quantize them:
+
+```plain
+optimum-cli export tflite \
+  -m deepset/roberta-base-squad2 \
+  --sequence_length 384  \
+  --quantize int8-dynamic roberta_tflite_model
+```
+
+## Accelerated training
+
+🤗 Optimum provides wrappers around the original 🤗 Transformers [Trainer](https://huggingface.co/docs/transformers/main_classes/trainer) to enable training on powerful hardware easily.
+We support many providers:
+
+- Habana's Gaudi processors
+- AWS Trainium instances, check [here](https://huggingface.co/docs/optimum-neuron/en/guides/distributed_training)
+- ONNX Runtime (optimized for GPUs)
+
+### Habana
+
+Before you begin, make sure you have all the necessary libraries installed :
+
+```bash
+pip install --upgrade --upgrade-strategy eager optimum[habana]
+```
 
 ```diff
 - from transformers import Trainer, TrainingArguments
@@ -141,9 +235,16 @@ To train transformers on Habana's Gaudi processors, 🤗 Optimum provides a `Gau
   trainer.train()
 ```
 
-#### ONNX Runtime
+You can find more examples in the [documentation](https://huggingface.co/docs/optimum/habana/quickstart) and in the [examples](https://github.com/huggingface/optimum-habana/tree/main/examples).
 
-To train transformers with ONNX Runtime's acceleration features, 🤗 Optimum provides a `ORTTrainer` that is very similar to the [🤗 Transformers trainer](https://huggingface.co/docs/transformers/main_classes/trainer). Here is a simple example:
+### ONNX Runtime
+
+
+Before you begin, make sure you have all the necessary libraries installed :
+
+```bash
+pip install optimum[onnxruntime-training]
+```
 
 ```diff
 - from transformers import Trainer, TrainingArguments
@@ -166,7 +267,6 @@ To train transformers with ONNX Runtime's acceleration features, 🤗 Optimum pr
       model=model,
       args=training_args,
       train_dataset=train_dataset,
-+     feature="sequence-classification", # The model type to export to ONNX
       ...
   )
 
@@ -174,71 +274,35 @@ To train transformers with ONNX Runtime's acceleration features, 🤗 Optimum pr
   trainer.train()
 ```
 
+You can find more examples in the [documentation](https://huggingface.co/docs/optimum/onnxruntime/usage_guides/trainer) and in the [examples](https://github.com/huggingface/optimum/tree/main/examples/onnxruntime/training).
 
-### Accelerated inference
 
-#### ONNX Runtime
+### Quanto
 
-To accelerate inference with ONNX Runtime, 🤗 Optimum uses _configuration objects_ to define parameters for optimization. These objects are then used to instantiate dedicated _optimizers_ and _quantizers_.
+[Quanto](https://github.com/huggingface/optimum-quanto) is a pytorch quantization backend.
 
-Before applying quantization or optimization, first export our model to the ONNX format:
-
-```python
-from optimum.onnxruntime import ORTModelForSequenceClassification
-from transformers import AutoTokenizer
-
-model_checkpoint = "distilbert-base-uncased-finetuned-sst-2-english"
-save_directory = "tmp/onnx/"
-# Load a model from transformers and export it to ONNX
-tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-ort_model = ORTModelForSequenceClassification.from_pretrained(model_checkpoint, from_transformers=True)
-# Save the onnx model and tokenizer
-ort_model.save_pretrained(save_directory)
-tokenizer.save_pretrained(save_directory)
-```
-
-Let's see now how we can apply dynamic quantization with ONNX Runtime:
+You can quantize a model either using the python API or the `optimum-cli`.
 
 ```python
-from optimum.onnxruntime.configuration import AutoQuantizationConfig
-from optimum.onnxruntime import ORTQuantizer
+from transformers import AutoModelForCausalLM
+from optimum.quanto import QuantizedModelForCausalLM, qint4
 
-# Define the quantization methodology
-qconfig = AutoQuantizationConfig.arm64(is_static=False, per_channel=False)
-quantizer = ORTQuantizer.from_pretrained(ort_model)
-# Apply dynamic quantization on the model
-quantizer.quantize(save_dir=save_directory, quantization_config=qconfig)
+model = AutoModelForCausalLM.from_pretrained('meta-llama/Meta-Llama-3.1-8B')
+qmodel = QuantizedModelForCausalLM.quantize(model, weights=qint4, exclude='lm_head')
 ```
 
-In this example, we've quantized a model from the Hugging Face Hub, but it could also be a path to a local model directory. The result from applying the `quantize()` method is a `model_quantized.onnx` file that can be used to run inference. Here's an example of how to load an ONNX Runtime model and generate predictions with it:
+The quantized model can be saved using `save_pretrained`:
 
 ```python
-from optimum.onnxruntime import ORTModelForSequenceClassification
-from transformers import pipeline, AutoTokenizer
-
-model = ORTModelForSequenceClassification.from_pretrained(save_directory, file_name="model_quantized.onnx")
-tokenizer = AutoTokenizer.from_pretrained(save_directory)
-classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
-results = classifier("I love burritos!")
+qmodel.save_pretrained('./Llama-3.1-8B-quantized')
 ```
 
-#### Optimum Intel
+It can later be reloaded using `from_pretrained`:
 
-Here is an example on how to perform inference with the OpenVINO Runtime:
+```python
+from optimum.quanto import QuantizedModelForCausalLM
 
-```diff
-- from transformers import AutoModelForSequenceClassification
-+ from optimum.intel.openvino import OVModelForSequenceClassification
-  from transformers import AutoTokenizer, pipeline
-
-  # Download a tokenizer and model from the Hub and convert to OpenVINO format
-  tokenizer = AutoTokenizer.from_pretrained(model_id)
-  model_id = "distilbert-base-uncased-finetuned-sst-2-english"
-- model = AutoModelForSequenceClassification.from_pretrained(model_id)
-+ model = OVModelForSequenceClassification.from_pretrained(model_id, from_transformers=True)
-
-  # Run inference!
-  classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
-  results = classifier("He's a dreadful magician.")
+qmodel = QuantizedModelForCausalLM.from_pretrained('Llama-3.1-8B-quantized')
 ```
 
+You can see more details and [examples](https://github.com/huggingface/optimum-quanto/tree/main/examples) in the [Quanto](https://github.com/huggingface/optimum-quanto) repository.

@@ -19,15 +19,22 @@ import logging
 import os
 import sys
 import threading
-from logging import CRITICAL  # NOQA
-from logging import DEBUG  # NOQA
-from logging import ERROR  # NOQA
-from logging import FATAL  # NOQA
-from logging import INFO  # NOQA
-from logging import NOTSET  # NOQA
-from logging import WARN  # NOQA
-from logging import WARNING  # NOQA
-from typing import Optional
+from functools import lru_cache
+from logging import (
+    CRITICAL,  # NOQA
+    DEBUG,  # NOQA
+    ERROR,  # NOQA
+    FATAL,  # NOQA
+    INFO,  # NOQA
+    NOTSET,  # NOQA
+    WARN,  # NOQA
+    WARNING,  # NOQA
+)
+from typing import TYPE_CHECKING, Optional
+
+
+if TYPE_CHECKING:
+    from logging import Logger
 
 
 _lock = threading.Lock()
@@ -62,17 +69,14 @@ def _get_default_logging_level():
 
 
 def _get_library_name() -> str:
-
     return __name__.split(".")[0]
 
 
 def _get_library_root_logger() -> logging.Logger:
-
     return logging.getLogger(_get_library_name())
 
 
 def _configure_library_root_logger() -> None:
-
     global _default_handler
 
     with _lock:
@@ -90,7 +94,6 @@ def _configure_library_root_logger() -> None:
 
 
 def _reset_library_root_logger() -> None:
-
     global _default_handler
 
     with _lock:
@@ -264,3 +267,8 @@ def reset_format() -> None:
 
     for handler in handlers:
         handler.setFormatter(None)
+
+
+@lru_cache(None)
+def warn_once(logger: "Logger", msg: str):
+    logger.warning(msg)

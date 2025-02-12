@@ -14,18 +14,33 @@ specific language governing permissions and limitations under the License.
 
 🤗 Optimum provides an `optimum.onnxruntime` package that enables you to apply graph optimization on many model hosted on the 🤗 hub using the [ONNX Runtime](https://github.com/microsoft/onnxruntime/tree/master/onnxruntime/python/tools/transformers) model optimization tool.
 
+## Optimizing a model during the ONNX export
 
-## Creating an `ORTOptimizer`
+The ONNX model can be directly optimized during the ONNX export using Optimum CLI, by passing the argument `--optimize {O1,O2,O3,O4}` in the CLI, for example:
 
-The [`~onnxruntime.ORTOptimizer`] class is used to optimize your ONNX model. The class can be initialized using the `from_pretrained()` method, which supports different checkpoint formats.
+```
+optimum-cli export onnx --model gpt2 --optimize O3 gpt2_onnx/
+```
 
-1. Using an already initialized `ORTModelForXXX` class.
+The optimization levels are:
+- O1: basic general optimizations.
+- O2: basic and extended general optimizations, transformers-specific fusions.
+- O3: same as O2 with GELU approximation.
+- O4: same as O3 with mixed precision (fp16, GPU-only, requires `--device cuda`).
+
+## Optimizing a model programmatically with `ORTOptimizer`
+
+ONNX models can be optimized with the [`~onnxruntime.ORTOptimizer`]. The class can be initialized using the [`~onnxruntime.ORTOptimizer.from_pretrained`] method, which supports different checkpoint formats.
+
+1. Using an already initialized [`~onnxruntime.ORTModel`] class.
 
 ```python
 >>> from optimum.onnxruntime import ORTOptimizer, ORTModelForSequenceClassification
 
 # Loading ONNX Model from the Hub
->>> model = ORTModelForSequenceClassification.from_pretrained("optimum/distilbert-base-uncased-finetuned-sst-2-english")
+>>> model = ORTModelForSequenceClassification.from_pretrained(
+...     "optimum/distilbert-base-uncased-finetuned-sst-2-english"
+... )
 
 # Create an optimizer from an ORTModelForXXX
 >>> optimizer = ORTOptimizer.from_pretrained(model)
@@ -37,10 +52,11 @@ The [`~onnxruntime.ORTOptimizer`] class is used to optimize your ONNX model. The
 >>> from optimum.onnxruntime import ORTOptimizer
 
 # This assumes a model.onnx exists in path/to/model
->>> optimizer = ORTOptimizer.from_pretrained("path/to/model")
+>>> optimizer = ORTOptimizer.from_pretrained("path/to/model")  # doctest: +SKIP
 ```
 
-## Optimization Configuration
+
+### Optimization Configuration
 
 The [`~onnxruntime.configuration.OptimizationConfig`] class allows to specify how the optimization should be performed by the [`~onnxruntime.ORTOptimizer`].
 
@@ -63,11 +79,17 @@ Here is a list of the possible optimizations you can enable:
 - Add Bias and Gelu / FastGelu fusion with `disable_bias_gelu_fusion=False`,
 - Gelu approximation with `enable_gelu_approximation=True`.
 
-While [`~onnxruntime.configuration.OptimizationConfig`] gives you full control on how to do optimization, it can be hard to know what to enable / disable. Instead, you can use [`~onnxruntime.configuration.AutoOptimizationConfig`] which provides 3 common optimizations levels:
+<Tip>
+
+Attention fusion is designed for right-side padding for BERT-like architectures (eg. BERT, RoBERTa, VIT, etc.) and for left-side padding for generative models (GPT-like). If you are not following the convention, please set `use_raw_attention_mask=True` to avoid potential accuracy issues but sacrifice the performance.
+
+</Tip>
+
+While [`~onnxruntime.configuration.OptimizationConfig`] gives you full control on how to do optimization, it can be hard to know what to enable / disable. Instead, you can use [`~onnxruntime.configuration.AutoOptimizationConfig`] which provides four common optimization levels:
 - O1: basic general optimizations.
-- O2: basic and extended general optimizations, `transformers`-specific fusions.
-- O3: same as O2 with Gelu approximation.
-- O4: same as O3 with mixed precision.
+- O2: basic and extended general optimizations, transformers-specific fusions.
+- O3: same as O2 with GELU approximation.
+- O4: same as O3 with mixed precision (fp16, GPU-only).
 
 Example: Loading a O2 [`~onnxruntime.configuration.OptimizationConfig`]
 
@@ -84,67 +106,92 @@ You can also specify custom argument that were not defined in the O2 configurati
 ```
 
 
-## Optimization examples
+### Optimization examples
 
 Below you will find an easy end-to-end example on how to optimize [distilbert-base-uncased-finetuned-sst-2-english](https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english).
 
 ```python
->>> from optimum.onnxruntime import ORTOptimizer, ORTModelForSequenceClassification, OptimizationConfig
+>>> from optimum.onnxruntime import (
+...     AutoOptimizationConfig, ORTOptimizer, ORTModelForSequenceClassification
+... )
 
 >>> model_id = "distilbert-base-uncased-finetuned-sst-2-english"
->>> save_dir = "/tmp/outputs"
+>>> save_dir = "distilbert_optimized"
 
-# Load a PyTorch model and export it to the ONNX format
->>> model = ORTModelForSequenceClassification.from_pretrained(model_id, from_transformers=True)
+>>> # Load a PyTorch model and export it to the ONNX format
+>>> model = ORTModelForSequenceClassification.from_pretrained(model_id, export=True)
 
-# Create the optimizer
+>>> # Create the optimizer
 >>> optimizer = ORTOptimizer.from_pretrained(model)
 
-# Define the optimization strategy by creating the appropriate configuration
->>> optimization_config = OptimizationConfig(
-    optimization_level=2,
-    enable_transformers_specific_optimizations=True,
-    optimize_for_gpu=False,
-)
+>>> # Define the optimization strategy by creating the appropriate configuration
+>>> optimization_config = AutoOptimizationConfig.O2()
 
-# Optimize the model
->>> optimizer.optimize(save_dir=save_dir, optimization_config=optimization_config)
+>>> # Optimize the model
+>>> optimizer.optimize(save_dir=save_dir, optimization_config=optimization_config)  # doctest: +IGNORE_RESULT
 ```
 
 
-Below you will find an easy end-to-end example on how to optimize a Seq2Seq model [sshleifer/distilbart-cnn-12-6"](https://huggingface.co/sshleifer/distilbart-cnn-12-6).
+Below you will find an easy end-to-end example on how to optimize a Seq2Seq model [sshleifer/distilbart-cnn-12-6](https://huggingface.co/sshleifer/distilbart-cnn-12-6).
 
 ```python
->>> from optimum.onnxruntime import ORTOptimizer, ORTModelForSeq2SeqLM, OptimizationConfig
 >>> from transformers import AutoTokenizer
+>>> from optimum.onnxruntime import  OptimizationConfig, ORTOptimizer, ORTModelForSeq2SeqLM
 
 >>> model_id = "sshleifer/distilbart-cnn-12-6"
->>> save_dir = "/tmp/outputs"
+>>> save_dir = "distilbart_optimized"
 
-# Load a PyTorch model and export it to the ONNX format
->>> model = ORTModelForSeq2SeqLM.from_pretrained(model_id, from_transformers=True)
+>>> # Load a PyTorch model and export it to the ONNX format
+>>> model = ORTModelForSeq2SeqLM.from_pretrained(model_id, export=True)
 
-# Create the optimizer
+>>> # Create the optimizer
 >>> optimizer = ORTOptimizer.from_pretrained(model)
 
-# Define the optimization strategy by creating the appropriate configuration
+>>> # Define the optimization strategy by creating the appropriate configuration
 >>> optimization_config = OptimizationConfig(
-    optimization_level=2,
-    enable_transformers_specific_optimizations=True,
-    optimize_for_gpu=False,
-)
+...     optimization_level=2,
+...     enable_transformers_specific_optimizations=True,
+...     optimize_for_gpu=False,
+... )
 
-# Optimize the model
->>> optimizer.optimize(save_dir=save_dir, optimization_config=optimization_config)
+>>> # Optimize the model
+>>> optimizer.optimize(save_dir=save_dir, optimization_config=optimization_config)  # doctest: +IGNORE_RESULT
 
-# Load the resulting optimized model
->>> optimized_model = ORTModelForSeq2SeqLM.from_pretrained(
-    save_dir,
-    encoder_file_name="encoder_model_optimized.onnx",
-    decoder_file_name="decoder_model_optimized.onnx",
-    decoder_file_with_past_name="decoder_with_past_model_optimized.onnx",
-)
 >>> tokenizer = AutoTokenizer.from_pretrained(model_id)
+>>> optimized_model = ORTModelForSeq2SeqLM.from_pretrained(save_dir)
 >>> tokens = tokenizer("This is a sample input", return_tensors="pt")
 >>> outputs = optimized_model.generate(**tokens)
 ```
+
+## Optimizing a model with Optimum CLI
+
+The Optimum ONNX Runtime optimization tools can be used directly through Optimum command-line interface:
+
+```bash
+optimum-cli onnxruntime optimize --help
+usage: optimum-cli <command> [<args>] onnxruntime optimize [-h] --onnx_model ONNX_MODEL -o OUTPUT (-O1 | -O2 | -O3 | -O4 | -c CONFIG)
+
+options:
+  -h, --help            show this help message and exit
+  -O1                   Basic general optimizations (see: https://huggingface.co/docs/optimum/onnxruntime/usage_guides/optimization for more details).
+  -O2                   Basic and extended general optimizations, transformers-specific fusions (see: https://huggingface.co/docs/optimum/onnxruntime/usage_guides/optimization for more
+                        details).
+  -O3                   Same as O2 with Gelu approximation (see: https://huggingface.co/docs/optimum/onnxruntime/usage_guides/optimization for more details).
+  -O4                   Same as O3 with mixed precision (see: https://huggingface.co/docs/optimum/onnxruntime/usage_guides/optimization for more details).
+  -c CONFIG, --config CONFIG
+                        `ORTConfig` file to use to optimize the model.
+
+Required arguments:
+  --onnx_model ONNX_MODEL
+                        Path to the repository where the ONNX models to optimize are located.
+  -o OUTPUT, --output OUTPUT
+                        Path to the directory where to store generated ONNX model.
+```
+
+Optimizing an ONNX model can be done as follows:
+
+```bash
+ optimum-cli onnxruntime optimize --onnx_model onnx_model_location/ -O1 -o optimized_model/
+```
+
+This optimizes all the ONNX files in `onnx_model_location` with the basic general optimizations. 

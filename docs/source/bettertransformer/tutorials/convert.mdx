@@ -20,6 +20,7 @@ pip install transformers accelerate optimum
 ```
 
 Also, make sure to install the latest version of PyTorch by following the guidelines on the [PyTorch official website](https://pytorch.org/get-started/locally/). Note that `BetterTransformer` API is only compatible with `torch>=1.13`, so make sure to have this version installed on your environement before starting.
+If you want to benefit from the `scaled_dot_product_attention` function (for decoder-based models), make sure to use at least `torch>=2.0`.
 
 ## Step 1: Load your model
 
@@ -44,7 +45,7 @@ Sometimes you can directly load your model on your GPU devices using `accelerate
 
 ## Step 2: Set your model on your preferred device
 
-If you did not used `device_map="auto"` to load your model (or if your model does not support `device_map="auto"`), you can manually set your model to a GPU:
+If you did not use `device_map="auto"` to load your model (or if your model does not support `device_map="auto"`), you can manually set your model to a GPU:
 ```python
 >>> model = model.to(0) # or model.to("cuda:0")
 ```
@@ -64,7 +65,7 @@ By default, `BetterTransformer.transform` will overwrite your model, which means
 
 >>> model_bt = BetterTransformer.transform(model, keep_original_model=True)
 ```
-If your model does not support `BetterTransformer` API, this will displayed on an error trace. Note also that decoder-based models (OPT, BLOOM, etc.) are not supported yet but this is in the roadmap of PyTorch for the future.
+If your model does not support the `BetterTransformer` API, this will be displayed on an error trace. Note also that decoder-based models (OPT, BLOOM, etc.) are not supported yet but this is in the roadmap of PyTorch for the future.
 
 ## Pipeline compatibility
 
@@ -83,7 +84,7 @@ If you want to run a pipeline on a GPU device, run:
 >>> ...
 ```
 
-You can also use `transformers.pipeline` as usual and pass the convertede model directly:
+You can also use `transformers.pipeline` as usual and pass the converted model directly:
 ```python
 >>> from transformers import pipeline
 
@@ -91,4 +92,25 @@ You can also use `transformers.pipeline` as usual and pass the convertede model 
 >>> ...
 ```
 
-Please refer to the [official documentation of `pipeline`](https://huggingface.co/docs/transformers/main_classes/pipelines) for further usage. If you face into any issue, do not hesitate to open an isse on GitHub!
+Please refer to the [official documentation of `pipeline`](https://huggingface.co/docs/transformers/main_classes/pipelines) for further usage. If you run into any issue, do not hesitate to open an issue on GitHub!
+
+## Training compatibility
+
+You can now benefit from the `BetterTransformer` API for your training scripts. Just make sure to convert back your model to its original version by calling `BetterTransformer.reverse` before saving your model.
+The code snippet below shows how:
+```python
+from optimum.bettertransformer import BetterTransformer
+from transformers import AutoModelForCausalLM
+
+with torch.device(“cuda”):
+    model = AutoModelForCausalLM.from_pretrained(“gpt2-large”, torch_dtype=torch.float16)
+
+model = BetterTransformer.transform(model)
+
+# do your inference or training here
+
+# if training and want to save the model
+model = BetterTransformer.reverse(model)
+model.save_pretrained("fine_tuned_model")
+model.push_to_hub("fine_tuned_model")
+```

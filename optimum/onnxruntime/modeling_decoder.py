@@ -15,33 +15,45 @@
 
 import logging
 import os
-import shutil
+import re
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import onnx
 import torch
-import transformers
-from transformers import AutoModelForCausalLM, PretrainedConfig
-from transformers.file_utils import add_start_docstrings_to_model_forward, default_cache_path
-from transformers.generation_utils import GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
-from transformers.onnx import FeaturesManager, export
-from transformers.onnx.utils import get_preprocessor
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+from onnx.tools import update_model_dims
+from transformers import AutoModelForCausalLM, GenerationConfig
+from transformers.file_utils import add_end_docstrings, add_start_docstrings_to_model_forward
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import onnxruntime
-from huggingface_hub import hf_hub_download
-from optimum.onnx.configuration import DecoderOnnxConfigWithPast
 
-from .io_binding import TypeHelper
-from .modeling_ort import ORTModel
-from .utils import (
-    ONNX_DECODER_NAME,
-    ONNX_DECODER_WITH_PAST_NAME,
-    ORTConfigManager,
-    get_provider_for_device,
-    parse_device,
+from ..exporters.onnx import MODEL_TYPES_REQUIRING_POSITION_IDS, main_export
+from ..onnx.utils import check_model_uses_external_data
+from ..utils import NormalizedConfigManager, is_transformers_version
+from ..utils.file_utils import find_files_matching_pattern
+from ..utils.save_utils import maybe_save_preprocessors
+from .constants import (
+    DECODER_MERGED_ONNX_FILE_PATTERN,
+    DECODER_ONNX_FILE_PATTERN,
+    DECODER_WITH_PAST_ONNX_FILE_PATTERN,
+    ONNX_FILE_PATTERN,
 )
+from .modeling_ort import ONNX_MODEL_END_DOCSTRING, ORTModel
+from .models.bloom import bloom_convert_to_bloom_cache, bloom_convert_to_standard_cache
+from .utils import ONNX_WEIGHTS_NAME
+
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+if is_transformers_version(">=", "4.25.0"):
+    from transformers.generation import GenerationMixin
+else:
+    from transformers.generation_utils import GenerationMixin  # type: ignore # noqa: F401
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +65,7 @@ DECODER_INPUTS_DOCSTRING = r"""
         attention_mask (`torch.LongTensor`, *optional*):
             Mask to avoid performing attention on padding token indices, of shape
             `(batch_size, sequence_length)`. Mask values selected in `[0, 1]`.
-        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*)`
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
             Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
             The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`.
@@ -66,7 +78,7 @@ CAUSALLM_ONNX_MODEL_DOCSTRING = r"""
         attention_mask (`torch.LongTensor`):
             Mask to avoid performing attention on padding token indices, of shape
             `(batch_size, sequence_length)`. Mask values selected in `[0, 1]`.
-        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*)`
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
             Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
             The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`.
@@ -88,7 +100,7 @@ TEXT_GENERATION_EXAMPLE = r"""
     >>> inputs = tokenizer("My name is Arthur and I live in", return_tensors="pt")
 
     >>> gen_tokens = model.generate(**inputs,do_sample=True,temperature=0.9, min_length=20,max_length=20)
-    >>> tokenizer.batch_decode(gen_tokens)
+    >>> tokenizer.batch_decode(gen_tokens)  # doctest: +IGNORE_RESULT
     ```
 
     Example using `transformers.pipelines`:
@@ -107,513 +119,88 @@ TEXT_GENERATION_EXAMPLE = r"""
 """
 
 
-class ORTDecoder:
+@add_end_docstrings(ONNX_MODEL_END_DOCSTRING)
+class ORTModelForCausalLM(ORTModel, GenerationMixin):
     """
-    Decoder model with a language modeling head on top for ONNX Runtime inference.
-    """
-
-    def __init__(
-        self,
-        session: onnxruntime.InferenceSession,
-        config: transformers.PretrainedConfig,
-        device: torch.device,
-        use_io_binding: bool = True,
-    ):
-        self.session = session
-        self.config = config
-        self.normalized_config = ORTConfigManager.get_normalized_config_class(self.config.model_type)(self.config)
-        self._device = device
-        self.use_io_binding = use_io_binding
-        self.session_inputs = {output_key.name: idx for idx, output_key in enumerate(self.session.get_inputs())}
-        self.session_outputs = {output_key.name: idx for idx, output_key in enumerate(self.session.get_outputs())}
-        self.session_input_names = list(self.session_inputs.keys())
-        self.session_output_names = list(self.session_outputs.keys())
-        self.key_value_input_names = [key for key in self.session_input_names if "key_values" in key]
-        self.key_value_output_names = [key for key in self.session_output_names if "key_values" in key]
-        self.name_to_np_type = TypeHelper.get_io_numpy_type_map(self.session) if self.use_io_binding else None
-
-    def prepare_output_buffer(
-        self,
-        output_name,
-        batch_size=None,
-        sequence_length=None,
-        past_sequence_length=None,
-    ):
-        """
-        Prepare the buffer of outputs(`logits`/`key_values`/`loss`) with 1D tensors.
-        """
-        ort_type = TypeHelper.get_output_type(self.session, output_name)
-        torch_type = TypeHelper.ort_type_to_torch_type(ort_type)
-        if output_name == "logits":
-            output_shape = (batch_size, sequence_length, self.normalized_config.vocab_size)
-            output_buffer = torch.empty(np.prod(output_shape), dtype=torch_type, device=self._device).contiguous()
-        elif "key_values" in output_name:
-            num_attention_heads = self.normalized_config.num_attention_heads
-            hidden_size = self.normalized_config.hidden_size
-            embed_size_per_head = hidden_size // num_attention_heads
-
-            if past_sequence_length is not None:
-                sequence_length += past_sequence_length
-            output_shape = (batch_size, num_attention_heads, sequence_length, embed_size_per_head)
-
-            output_buffer = torch.empty(np.prod(output_shape), dtype=torch_type, device=self._device).contiguous()
-
-        return output_shape, output_buffer
-
-    def prepare_io_binding(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-    ):
-        io_binding = self.session.io_binding()
-
-        # Bind the inputs
-
-        # Bind input ids
-        input_ids = input_ids.contiguous()
-        io_binding.bind_input(
-            "input_ids",
-            input_ids.device.type,
-            self._device.index,
-            self.name_to_np_type["input_ids"],
-            tuple(input_ids.shape),
-            input_ids.data_ptr(),
-        )
-
-        # Bind the attention mask
-        attention_mask = attention_mask.contiguous()
-        io_binding.bind_input(
-            "attention_mask",
-            attention_mask.device.type,
-            self._device.index,
-            self.name_to_np_type["attention_mask"],
-            tuple(attention_mask.shape),
-            attention_mask.data_ptr(),
-        )
-
-        # Bind the past key values
-        if past_key_values is not None:
-            for input_name, past_key_value in zip(self.key_value_input_names, past_key_values):
-                past_key_value = past_key_value.contiguous()
-                io_binding.bind_input(
-                    input_name,
-                    past_key_value.device.type,
-                    self._device.index,
-                    self.name_to_np_type[input_name],
-                    tuple(past_key_value.shape),
-                    past_key_value.data_ptr(),
-                )
-
-        # Bind the outputs
-
-        # Bind the logits
-        logits_shape, logits_buffer = self.prepare_output_buffer(
-            output_name="logits",
-            batch_size=input_ids.size(0),
-            sequence_length=input_ids.size(1),
-        )
-        io_binding.bind_output(
-            "logits",
-            logits_buffer.device.type,
-            self._device.index,
-            self.name_to_np_type["logits"],
-            logits_shape,
-            logits_buffer.data_ptr(),
-        )
-        output_shapes = {"logits": logits_shape}
-        output_buffers = {"logits": logits_buffer}
-
-        # Bind the past keys values
-        for key_value_output_name in self.key_value_output_names:
-            self_pkv_shape, self_pkv_buffer = self.prepare_output_buffer(
-                output_name=key_value_output_name,
-                batch_size=input_ids.size(0),
-                sequence_length=input_ids.size(1),
-                past_sequence_length=past_key_values[0].size(2)
-                if past_key_values
-                else None,  # sequence length of self-attention key for layer.0
-            )
-            io_binding.bind_output(
-                key_value_output_name,
-                self_pkv_buffer.device.type,
-                self._device.index,
-                self.name_to_np_type[key_value_output_name],
-                self_pkv_shape,
-                self_pkv_buffer.data_ptr(),
-            )
-            # set -1 for sequence_length as it could be larger than the real sequence_length for creating buffer
-            self_pkv_shape = self_pkv_shape[:2] + (-1,) + self_pkv_shape[3:]
-            output_shapes[key_value_output_name] = self_pkv_shape
-            output_buffers[key_value_output_name] = self_pkv_buffer
-
-        return io_binding, output_shapes, output_buffers
-
-    @add_start_docstrings_to_model_forward(DECODER_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-    ) -> CausalLMOutputWithCrossAttentions:
-        # Flatten the past_key_values
-        if past_key_values is not None:
-            past_key_values = [past_key_value for pkv_per_layer in past_key_values for past_key_value in pkv_per_layer]
-
-        if self._device.type == "cuda" and self.use_io_binding:
-            io_binding, output_shapes, output_buffers = self.prepare_io_binding(
-                input_ids, attention_mask, past_key_values
-            )
-
-            # run inference with binding & synchronize in case of multiple CUDA streams
-            io_binding.synchronize_inputs()
-            self.session.run_with_iobinding(io_binding)
-            io_binding.synchronize_outputs()
-
-            # Tuple of length equal to : number of layer * number of past_key_value per decoder layer(2)
-            past_key_values = tuple()
-            for name in self.key_value_output_names:
-                past_key_values += (output_buffers[name].view(output_shapes[name]),)
-
-            # Tuple of tuple of length `n_layers`, with each tuple of length equal to 2 (self-attention key and value per decoder layer)
-            num_pkv = 2
-            past_key_values = tuple(past_key_values[i : i + num_pkv] for i in range(0, len(past_key_values), num_pkv))
-
-            logits = output_buffers["logits"].view(output_shapes["logits"])
-        else:
-            onnx_inputs = {
-                "input_ids": input_ids.cpu().detach().numpy(),
-                "attention_mask": attention_mask.cpu().detach().numpy(),
-            }
-
-            if past_key_values is not None:
-                # Add the past_key_values to the decoder inputs
-                for input_name, past_key_value in zip(self.key_value_input_names, past_key_values):
-                    onnx_inputs[input_name] = past_key_value.cpu().detach().numpy()
-
-            # Run inference
-            outputs = self.session.run(None, onnx_inputs)
-
-            # Tuple of length equal to : number of layer * number of past_key_value per decoder layer (2 for the self-attention)
-            past_key_values = tuple(
-                torch.from_numpy(outputs[self.session_outputs[key]]).to(self._device)
-                for key in self.key_value_output_names
-            )
-
-            # Tuple of tuple of length `n_layers`, with each tuple of length equal to the number of self-attention and
-            # per decoder layer
-            num_pkv = 2
-            past_key_values = tuple(past_key_values[i : i + num_pkv] for i in range(0, len(past_key_values), num_pkv))
-            logits = torch.from_numpy(outputs[self.session_outputs["logits"]]).to(self._device)
-
-        return CausalLMOutputWithCrossAttentions(logits=logits, past_key_values=past_key_values)
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-
-class ORTModelDecoder(ORTModel):
-    """
-    Base class for implementing models with a causal language modeling head using ONNX Runtime inference.
+    ONNX model with a causal language modeling head for ONNX Runtime inference. This class officially supports bloom, codegen, falcon, gpt2, gpt_bigcode, gpt_neo, gpt_neox, gptj, llama.
     """
 
-    def __init__(
-        self,
-        config: transformers.PretrainedConfig,
-        decoder_session: onnxruntime.InferenceSession,
-        decoder_with_past_session: Optional[onnxruntime.InferenceSession] = None,
-        use_io_binding: bool = True,
-        model_save_dir: str = "",
-        last_decoder_model_name: str = ONNX_DECODER_NAME,
-        last_decoder_with_past_model_name: str = ONNX_DECODER_WITH_PAST_NAME,
-    ):
-        """
-        Args:
-            decoder_session (`onnxruntime.InferenceSession`):
-                The ONNX Runtime inference session associated to the decoder.
-            config (`transformers.PretrainedConfig`):
-                An instance of the configuration associated to the model. Initializing with a config file does
-                not load the weights associated with the model, only the configuration.
-            decoder_with_past_session (`Optional[onnxruntime.InferenceSession]`, *optional*):
-                The ONNX Runtime inference session associated to the decoder with past key values.
-            use_io_binding (`bool`, *optional*, defaults to `True`):
-                Whether use IOBinding during inference to avoid memory copy between the host and devices. Defaults to
-                `True` if the device is CUDA, otherwise defaults to `False`.
-            model_save_dir (`str`, *optional*, defaults to `""`):
-                The directory under which the model exported to ONNX was saved.
-            last_decoder_model_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_DECODER_NAME`):
-                The name of the ONNX file containing the decoder part of the model.
-            last_decoder_with_past_model_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_DECODER_WITH_PAST_NAME`):
-                The name of the ONNX file containing the decoder with past key/values part of the model.
-        """
-        super().__init__(
-            decoder_session,
-            config,
-            use_io_binding=use_io_binding,
-            model_save_dir=model_save_dir,
-            latest_model_name=last_decoder_model_name,
-        )
-        self.decoder_file_name = last_decoder_model_name
-        self.decoder_file_with_past_name = last_decoder_with_past_model_name
-
-        self.use_cache = decoder_with_past_session is not None
-        self.decoder = ORTDecoder(
-            session=self.model, config=self.config, device=self._device, use_io_binding=self.use_io_binding
-        )
-        self.decoder_with_past = None
-        if self.use_cache:
-            self.decoder_with_past = ORTDecoder(
-                session=decoder_with_past_session,
-                config=self.config,
-                device=self._device,
-                use_io_binding=self.use_io_binding,
-            )
-
-    @staticmethod
-    def load_model(
-        decoder_path: Union[str, Path],
-        decoder_with_past_path: Optional[Union[str, Path]] = None,
-        provider: str = "CPUExecutionProvider",
-        session_options: Optional[onnxruntime.SessionOptions] = None,
-        provider_options: Optional[Dict] = None,
-    ):
-        """
-        Creates an instance of [`~optimum.onnxruntime.ORTModelDecoder`].
-        Three inference sessions will be created for respectively the decoder and decoder with past key values
-        models. The default provider is `CPUExecutionProvider` to match the default behaviour in PyTorch/TensorFlow/JAX.
-
-        Args:
-            decoder_path (`str` or `Path`):
-                The path of the decoder ONNX model.
-            decoder_with_past_path (`str` or `Path`, *optional*):
-                The path of the decoder with past key values ONNX model.
-            provider(`str`, *optional*, defaults to `"CPUExecutionProvider"`):
-                The ONNX Runtime provider to use for loading the model.
-            session_options (`Optional[onnxruntime.SessionOptions]`, *optional*),:
-                ONNX Runtime session options to use for loading the model.
-            provider_options (`Optional[Dict]`, *optional*):
-                Provider option dictionary corresponding to the provider used. See available options
-                for each provider: https://onnxruntime.ai/docs/api/c/group___global.html.
-        """
-        available_providers = onnxruntime.get_available_providers()
-        if provider not in available_providers:
-            raise ValueError(
-                f"Asked to use {provider} as an ONNX Runtime execution provider, but the available execution providers are {available_providers}."
-            )
-
-        providers = [provider]
-        if provider == "TensorrtExecutionProvider":
-            # follow advice in https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html#python
-            providers.append("CUDAExecutionProvider")
-
-        decoder_session = onnxruntime.InferenceSession(
-            str(decoder_path),
-            providers=providers,
-            sess_options=session_options,
-            provider_options=None if provider_options is None else [provider_options],
-        )
-        decoder_with_past_session = None
-        # If a decoder_with_past_path is provided, an inference session for the decoder with past key/values as inputs
-        # will be enabled
-        if decoder_with_past_path is not None:
-            decoder_with_past_session = onnxruntime.InferenceSession(
-                str(decoder_with_past_path),
-                providers=providers,
-                sess_options=session_options,
-                provider_options=None if provider_options is None else [provider_options],
-            )
-        return decoder_session, decoder_with_past_session
-
-    def _save_pretrained(
-        self,
-        save_directory: Union[str, Path],
-        decoder_file_name: str = ONNX_DECODER_NAME,
-        decoder_with_past_file_name: str = ONNX_DECODER_WITH_PAST_NAME,
-    ):
-        """
-        Saves the model decoder and decoder with past key values as well as its configuration file to a
-        directory, so that it can be re-loaded using the
-        [`~optimum.onnxruntime.modeling_causal.ORTModelDecoder.from_pretrained`] class method.
-
-        Args:
-            save_directory (`str` or `Path`):
-                The directory where to save the model files.
-            decoder_file_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_DECODER_NAME`):
-                The decoder model file name. Overwrites the default file name and allows one to save the decoder model
-                with a different name.
-            decoder_with_past_file_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_DECODER_WITH_PAST_NAME`):
-                The decoder with past key values model file name overwriting the default file name, allowing to save
-                the decoder model with a different name.
-        """
-        src_file_names = [self.decoder_file_name]
-        dst_file_names = [decoder_file_name]
-        if self.use_cache:
-            src_file_names.append(self.decoder_file_with_past_name)
-            dst_file_names.append(decoder_with_past_file_name)
-
-        for src_file_name, dst_file_name in zip(src_file_names, dst_file_names):
-            src_path = self.model_save_dir.joinpath(src_file_name)
-            dst_path = Path(save_directory).joinpath(dst_file_name)
-            shutil.copyfile(src_path, dst_path)
-
-    @classmethod
-    def _from_pretrained(
-        cls,
-        model_id: Union[str, Path],
-        config: "PretrainedConfig",
-        use_auth_token: Optional[Union[bool, str]] = None,
-        revision: Optional[str] = None,
-        force_download: bool = True,
-        cache_dir: Optional[str] = None,
-        decoder_file_name: str = ONNX_DECODER_NAME,
-        decoder_with_past_file_name: str = ONNX_DECODER_WITH_PAST_NAME,
-        subfolder: str = "",
-        local_files_only: bool = False,
-        use_cache: bool = True,
-        use_io_binding: bool = True,
-        provider: str = "CPUExecutionProvider",
-        session_options: Optional[onnxruntime.SessionOptions] = None,
-        provider_options: Optional[Dict[str, Any]] = None,
-    ):
-        file_names = {}
-        # Load model from a local directory
-        if os.path.isdir(os.path.join(model_id, subfolder)):
-            decoder_with_past_path = (
-                os.path.join(model_id, subfolder, decoder_with_past_file_name) if use_cache else None
-            )
-            model = cls.load_model(
-                decoder_path=os.path.join(model_id, subfolder, decoder_file_name),
-                decoder_with_past_path=decoder_with_past_path,
-                provider=provider,
-                session_options=session_options,
-                provider_options=provider_options,
-            )
-            model_save_dir = Path(model_id).joinpath(subfolder)
-            file_names["last_decoder_model_name"] = decoder_file_name
-            file_names["last_decoder_with_past_model_name"] = decoder_with_past_file_name
-        # Load model from hub
-        else:
-            default_file_names = [ONNX_DECODER_NAME]
-            model_file_names = [decoder_file_name]
-            if use_cache:
-                default_file_names.append(ONNX_DECODER_WITH_PAST_NAME)
-                model_file_names.append(decoder_with_past_file_name)
-            # Download the decoder and decoder_with_past forming the model
-            for file_name, default_file_name in zip(model_file_names, default_file_names):
-                model_cache_path = hf_hub_download(
-                    repo_id=model_id,
-                    subfolder=subfolder,
-                    filename=file_name,
-                    use_auth_token=use_auth_token,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    local_files_only=local_files_only,
-                )
-                file_names[f"last_{default_file_name.split('.')[0]}_name"] = Path(model_cache_path).name
-            model_save_dir = Path(model_cache_path).parent
-
-            last_decoder_with_past_name = file_names.get("last_decoder_with_past_model_name", None)
-            if last_decoder_with_past_name is not None:
-                last_decoder_with_past_name = model_save_dir.joinpath(last_decoder_with_past_name)
-            model = cls.load_model(
-                decoder_path=model_save_dir.joinpath(file_names["last_decoder_model_name"]),
-                decoder_with_past_path=last_decoder_with_past_name,
-                provider=provider,
-                session_options=session_options,
-                provider_options=provider_options,
-            )
-
-        return cls(
-            config,
-            *model,
-            use_io_binding=use_io_binding,
-            model_save_dir=model_save_dir,
-            last_decoder_model_name=file_names["last_decoder_model_name"],
-            last_decoder_with_past_model_name=file_names.get("last_decoder_with_past_model_name", None),
-        )
-
-    @classmethod
-    def _from_transformers(
-        cls,
-        model_id: str,
-        config: "PretrainedConfig",
-        subfolder: Optional[str] = "",
-        save_dir: Union[str, Path] = default_cache_path,
-        use_auth_token: Optional[Union[bool, str]] = None,
-        revision: Optional[str] = None,
-        force_download: bool = True,
-        cache_dir: Optional[str] = None,
-        use_cache: bool = True,
-        **kwargs,
-    ):
-        # Create local save dir in cache dir
-        save_dir = Path(save_dir).joinpath(model_id)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        preprocessor = get_preprocessor(model_id)
-        framework = FeaturesManager.determine_framework(os.path.join(model_id, subfolder))
-        model_class = FeaturesManager.get_model_class_for_feature(cls.export_feature, framework)
-        model = model_class.from_pretrained(model_id, subfolder=subfolder, config=config, cache_dir=cache_dir)
-
-        # Export the decoder without the past key values
-        onnx_config = DecoderOnnxConfigWithPast(model.config, task=cls.export_feature, use_past=False)
-        onnx_opset = onnx_config.default_onnx_opset
-        export(
-            preprocessor=preprocessor,
-            model=model,
-            config=onnx_config,
-            opset=onnx_opset,
-            output=save_dir.joinpath(ONNX_DECODER_NAME),
-        )
-
-        # Export the decoder with the past key values
-        if use_cache:
-            onnx_config_with_past = DecoderOnnxConfigWithPast(model.config, task=cls.export_feature, use_past=True)
-            export(
-                preprocessor=preprocessor,
-                model=model,
-                config=onnx_config_with_past,
-                opset=onnx_opset,
-                output=save_dir.joinpath(ONNX_DECODER_WITH_PAST_NAME),
-            )
-
-        return cls._from_pretrained(save_dir, config=config, use_cache=use_cache, **kwargs)
-
-    def to(self, device: Union[torch.device, str, int]):
-        """
-        Changes the ONNX Runtime provider according to the device.
-
-        Args:
-            device (`Union[torch.device, str, int]`):
-                Device ordinal for CPU/GPU supports. Setting this to -1 will leverage CPU, a positive will run
-                the model on the associated CUDA device id. You can pass native `torch.device` or a `str` too.
-
-        Returns:
-            `ORTModel`: the model placed on the requested device.
-        """
-        device, provider_options = parse_device(device)
-
-        provider = get_provider_for_device(device)
-        self.device = device
-        self.decoder._device = device
-        self.decoder.session.set_providers([provider], provider_options=[provider_options])
-        if self.decoder_with_past is not None:
-            self.decoder_with_past._device = device
-            self.decoder_with_past.session.set_providers([provider], provider_options=[provider_options])
-        self.providers = self.decoder.session.get_providers()
-
-        return self
-
-
-class ORTModelForCausalLM(ORTModelDecoder, GenerationMixin):
-    """
-    ONNX model with a causal language modeling head for ONNX Runtime inference.
-    """
-
-    # Used to export the model to ONNX
-    export_feature = "causal-lm"
     auto_model_class = AutoModelForCausalLM
     main_input_name = "input_ids"
+    _supports_cache_class = False
+
+    def __init__(
+        self,
+        model: onnxruntime.InferenceSession,
+        config: "PretrainedConfig",
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        preprocessors: Optional[List] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ):
+        if use_io_binding is None:
+            use_io_binding = model.get_providers()[0] in ["CPUExecutionProvider", "CUDAExecutionProvider"]
+
+        super().__init__(model, config, use_io_binding, model_save_dir, preprocessors, **kwargs)
+
+        self.num_pkv = 2
+        self.normalized_config = NormalizedConfigManager.get_normalized_config_class(config.model_type)(config)
+        self.key_value_input_names = [key for key in self.input_names if (".key" in key) or (".value" in key)]
+        self.key_value_output_names = [key for key in self.output_names if (".key" in key) or (".value" in key)]
+        self.use_cache = len(self.key_value_input_names) > 0
+
+        if generation_config is None:
+            generation_config = GenerationConfig.from_model_config(config)
+
+        self.generation_config = generation_config
+
+        if is_transformers_version(">=", "4.44.99"):
+            misplaced_generation_parameters = self.config._get_non_default_generation_parameters()
+            if len(misplaced_generation_parameters) > 0:
+                logger.warning(
+                    "Moving the following attributes in the config to the generation config: "
+                    f"{misplaced_generation_parameters}. You are seeing this warning because you've set "
+                    "generation parameters in the model config, as opposed to in the generation config.",
+                )
+                for param_name, param_value in misplaced_generation_parameters.items():
+                    setattr(self.generation_config, param_name, param_value)
+                    setattr(self.config, param_name, None)
+
+        self.onnx_paths = [self.model_path]
+        self.use_merged = "use_cache_branch" in self.input_names
+        self.model_type = self.config.model_type
+
+        self.use_fp16 = False
+        for inp in model.get_inputs():
+            if (
+                inp.name == "past_key_values" or inp.name in self.key_value_input_names
+            ) and inp.type == "tensor(float16)":
+                self.use_fp16 = True
+                break
+
+        # Reference: https://github.com/huggingface/optimum/pull/1381
+        model_type = config.model_type.replace("_", "-")
+        if model_type in MODEL_TYPES_REQUIRING_POSITION_IDS and "position_ids" not in self.input_names:
+            logger.warning(
+                f"ORTModelForCausalLM loaded a legacy ONNX model with no position_ids input, although this input is required for batched generation for the architecture {model_type}. "
+                "We strongly encourage to re-export the model with optimum>=1.14 for position_ids and batched inference support."
+            )
+
+        if use_cache ^ self.use_cache:
+            raise ValueError(
+                f"`use_cache` was set to `{use_cache}` but the loaded model only supports `use_cache={self.use_cache}`. "
+                f"Please load your current model with `use_cache={self.use_cache}` or export the original model "
+                f"once again with `use_cache={use_cache}` when calling the `from_pretrained` method. "
+                "To export your model, simply set `export=True`."
+            )
+
+        if use_io_binding and not use_cache:
+            raise ValueError(
+                "The parameters combination use_cache=False, use_io_binding=True is not supported. "
+                "Please either pass use_cache=True, use_io_binding=True (default), or use_cache=False, use_io_binding=False."
+            )
 
     @add_start_docstrings_to_model_forward(
         CAUSALLM_ONNX_MODEL_DOCSTRING.format("batch_size, sequence_length")
@@ -625,37 +212,490 @@ class ORTModelForCausalLM(ORTModelDecoder, GenerationMixin):
     )
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor,
         attention_mask: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        use_cache_branch: bool = None,
         **kwargs,
-    ) -> CausalLMOutputWithCrossAttentions:
+    ) -> CausalLMOutputWithPast:
+        # adding use_cache_branch in the signature here is just a hack for IO Binding
+        use_torch = isinstance(input_ids, torch.Tensor)
+        self.raise_on_numpy_input_io_binding(use_torch)
 
-        if past_key_values is None or self.decoder_with_past is None:
-            outputs = self.decoder(input_ids=input_ids, attention_mask=attention_mask)
-        else:
-            outputs = self.decoder_with_past(
-                input_ids=input_ids[:, -1:],
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
+        known_output_shapes = {}
+
+        if self.use_cache:
+            if past_key_values is not None:
+                # Flatten the past_key_values (gpt_bigcode has fused key/value cache, so no need to flatten it)
+                if self.model_type != "gpt_bigcode":
+                    past_key_values = tuple(
+                        past_key_value for pkv_per_layer in past_key_values for past_key_value in pkv_per_layer
+                    )
+
+            # Create dummy past_key_values for decoder first generation step if none given
+            use_cache_branch, past_key_values, known_output_shapes = self.prepare_past_key_values(
+                input_ids, past_key_values, use_torch
             )
 
-        return CausalLMOutputWithCrossAttentions(logits=outputs.logits, past_key_values=outputs.past_key_values)
+        # Create position_ids on the fly for batch generation
+        if "position_ids" in self.input_names and position_ids is None and attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
+
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "use_cache_branch": use_cache_branch,
+        }
+
+        if past_key_values is not None:
+            model_inputs.update(
+                zip(self.key_value_input_names, past_key_values),
+            )
+
+        if self.use_io_binding:
+            io_binding, output_shapes, output_buffers = self._prepare_io_binding(
+                self.model, model_inputs, known_output_shapes=known_output_shapes
+            )
+
+            if self.device.type == "cpu":
+                self.model.run_with_iobinding(io_binding)
+            else:
+                io_binding.synchronize_inputs()
+                self.model.run_with_iobinding(io_binding)
+                io_binding.synchronize_outputs()
+
+            loss = output_buffers.get("loss", None)
+            logits = output_buffers["logits"].view(output_shapes["logits"])
+
+            if self.use_cache:
+                # Tuple of length equal to : number of layer * number of past_key_value per decoder layer(2 for the self-attention)
+                past_key_values = tuple(
+                    output_buffers[name].view(output_shapes[name]) for name in self.key_value_output_names
+                )
+
+        else:
+            onnx_inputs = self._prepare_onnx_inputs(use_torch, model_inputs)
+            onnx_outputs = self.model.run(None, onnx_inputs)
+            model_outputs = self._prepare_onnx_outputs(use_torch, onnx_outputs)
+
+            loss = model_outputs.get("loss", None)
+            logits = model_outputs["logits"]
+
+            if self.use_cache:
+                # Tuple of length equal to : number of layer * number of past_key_value per decoder layer (2 for the self-attention)
+                past_key_values = tuple(model_outputs[output_name] for output_name in self.key_value_output_names)
+
+        if self.use_cache and self.model_type != "gpt_bigcode":
+            # Tuple of tuple of length `n_layers`, with each tuple of length equal to the number of self-attention and per decoder layer
+            past_key_values = tuple(
+                past_key_values[i : i + self.num_pkv] for i in range(0, len(past_key_values), self.num_pkv)
+            )
+
+        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values)
+
+    def prepare_past_key_values(
+        self,
+        input_ids: Union[None, torch.LongTensor, np.ndarray],
+        past_key_values: Union[None, Tuple[torch.FloatTensor], Tuple[np.ndarray]],
+        use_torch: bool,
+    ):
+        sequence_length = input_ids.shape[1]
+
+        constructor = torch if use_torch else np
+        if self.use_merged:
+            # Uses without/with branch of a merged decoder depending on whether real past key values are passed
+            use_cache_branch = constructor.full((1,), past_key_values is not None)
+        else:
+            # Uses separate decoders
+            use_cache_branch = None
+
+        if use_torch and use_cache_branch is not None:
+            use_cache_branch = use_cache_branch.to(self.device)
+
+        pkv_output_shape = {}
+        # Generate dummy past for the first forward if uses a merged decoder
+        if past_key_values is None:
+            batch_size = input_ids.shape[0]
+            embed_size_per_head = self.normalized_config.hidden_size // self.normalized_config.num_attention_heads
+            if self.model_type == "gemma":
+                num_attention_heads = self.normalized_config.num_key_value_heads
+                embed_size_per_head = self.normalized_config.head_dim
+            elif self.model_type in {"mistral", "llama", "qwen2", "granite"}:
+                num_attention_heads = self.normalized_config.num_key_value_heads
+            else:
+                num_attention_heads = self.normalized_config.num_attention_heads
+
+            dtype = constructor.float16 if self.use_fp16 else constructor.float32
+
+            # TODO: find a way to better handle this controlflow, this is EXTREMELY UGLY.
+            if self.__class__.__name__ == "ORTBloomForCausalLM":
+                shape_value = (batch_size * num_attention_heads, 0, embed_size_per_head)
+                shape_key = (batch_size * num_attention_heads, embed_size_per_head, 0)
+                key = constructor.zeros(shape_key, dtype=dtype)
+                value = constructor.zeros(shape_value, dtype=dtype)
+
+                if use_torch:
+                    key = key.to(self.device)
+                    value = value.to(self.device)
+
+                past_key_values = tuple(
+                    key_or_value for _ in range(len(self.key_value_input_names) // 2) for key_or_value in [key, value]
+                )
+
+                for name, value in zip(self.key_value_output_names, past_key_values):
+                    shape = [*value.shape]
+                    index = 1 if "value" in name else 2
+                    shape[index] += sequence_length
+                    pkv_output_shape[name] = shape
+
+            elif self.model_type == "gpt_bigcode":
+                # GPT BigCode uses muti-query attention, and has the specificity of putting both key and value in the same cache tensor.
+                shape_key_and_value = (batch_size, 0, embed_size_per_head * 2)
+                key_and_value = constructor.zeros(shape_key_and_value, dtype=dtype)
+
+                if use_torch:
+                    key_and_value = key_and_value.to(self.device)
+
+                past_key_values = tuple(key_and_value for _ in range(len(self.key_value_input_names)))
+
+                for name, value in zip(self.key_value_output_names, past_key_values):
+                    shape = [*value.shape]
+                    shape[1] += sequence_length
+                    pkv_output_shape[name] = shape
+
+            else:
+                num_key_value_heads = self.num_key_value_heads if self.model_type == "falcon" else num_attention_heads
+                shape = (batch_size, num_key_value_heads, 0, embed_size_per_head)
+                key_or_value = constructor.zeros(shape, dtype=dtype)
+
+                if use_torch:
+                    key_or_value = key_or_value.to(self.device)
+
+                past_key_values = tuple(key_or_value for _ in range(len(self.key_value_input_names)))
+
+                for name, value in zip(self.key_value_output_names, past_key_values):
+                    shape = [*value.shape]
+                    shape[2] += sequence_length
+                    pkv_output_shape[name] = shape
+
+        return use_cache_branch, past_key_values, pkv_output_shape
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        model_id: Union[str, Path],
+        config: "PretrainedConfig",
+        token: Optional[Union[bool, str]] = None,
+        revision: Optional[str] = None,
+        force_download: bool = False,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
+        file_name: Optional[str] = None,
+        subfolder: str = "",
+        use_cache: bool = True,
+        local_files_only: bool = False,
+        use_merged: Optional[bool] = None,
+        provider: str = "CPUExecutionProvider",
+        session_options: Optional[onnxruntime.SessionOptions] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        **kwargs,
+    ) -> "ORTModelForCausalLM":
+        generation_config = kwargs.pop("generation_config", None)
+
+        # We do not implement the logic for use_cache=False, use_merged=True
+        if use_cache is False:
+            if use_merged is True:
+                raise ValueError(
+                    "The parameters combination use_cache=False, use_merged=True is not supported."
+                    " To use a merged decoder, past key values must be used."
+                )
+            use_merged = False
+
+        onnx_files = find_files_matching_pattern(
+            model_id,
+            ONNX_FILE_PATTERN,
+            glob_pattern="**/*.onnx",
+            subfolder=subfolder,
+            token=token,
+            revision=revision,
+        )
+
+        if len(onnx_files) == 0:
+            raise FileNotFoundError(f"Could not find any ONNX model file in {model_id}")
+
+        if len(onnx_files) == 1:
+            subfolder = onnx_files[0].parent
+            _file_name = onnx_files[0].name
+            if file_name and file_name != _file_name:
+                raise FileNotFoundError(f"Trying to load {file_name} but only found {_file_name}")
+            file_name = _file_name
+
+        else:
+            model_files = []
+            # Check first for merged models and then for decoder / decoder_with_past models
+            if use_merged is not False:
+                model_files = [p for p in onnx_files if re.search(DECODER_MERGED_ONNX_FILE_PATTERN, str(p))]
+                use_merged = len(model_files) != 0
+
+            if use_merged is False:
+                pattern = DECODER_WITH_PAST_ONNX_FILE_PATTERN if use_cache else DECODER_ONNX_FILE_PATTERN
+                model_files = [p for p in onnx_files if re.search(pattern, str(p))]
+
+            # if file_name is specified we don't filter legacy models
+            if not model_files or file_name:
+                model_files = onnx_files
+            else:
+                logger.warning(
+                    f"Legacy models found in {model_files} will be loaded. "
+                    "Legacy models will be deprecated in the next version of optimum, please re-export your model"
+                )
+            _file_name = model_files[0].name
+            subfolder = model_files[0].parent
+
+            defaut_file_name = file_name or "model.onnx"
+            for file in model_files:
+                if file.name == defaut_file_name:
+                    _file_name = file.name
+                    subfolder = file.parent
+                    break
+
+            file_name = _file_name
+
+            if len(model_files) > 1:
+                logger.warning(
+                    f"Too many ONNX model files were found in {' ,'.join(map(str, model_files))}. "
+                    "specify which one to load by using the `file_name` and/or the `subfolder` arguments. "
+                    f"Loading the file {file_name} in the subfolder {subfolder}."
+                )
+
+        if os.path.isdir(model_id):
+            model_id = subfolder
+            subfolder = ""
+
+        model_cache_path, preprocessors = cls._cached_file(
+            model_path=model_id,
+            token=token,
+            revision=revision,
+            force_download=force_download,
+            cache_dir=cache_dir,
+            file_name=file_name,
+            subfolder=subfolder,
+            local_files_only=local_files_only,
+        )
+        new_model_save_dir = Path(model_cache_path).parent
+
+        # model_save_dir can be provided in kwargs as a TemporaryDirectory instance, in which case we want to keep it
+        # instead of the path only.
+        if model_save_dir is None:
+            model_save_dir = new_model_save_dir
+
+        onnx_model = onnx.load(str(model_cache_path), load_external_data=False)
+        model_uses_external_data = check_model_uses_external_data(onnx_model)
+
+        if model_uses_external_data:
+            onnx_model = onnx.load(str(model_cache_path), load_external_data=True)
+
+        input_dims = {
+            node.name: [dim.dim_value or dim.dim_param for dim in node.type.tensor_type.shape.dim]
+            for node in onnx_model.graph.input
+        }
+        output_dims = {
+            node.name: [dim.dim_value or dim.dim_param for dim in node.type.tensor_type.shape.dim]
+            for node in onnx_model.graph.output
+        }
+
+        override_dims = False
+
+        # Since v1.7.0 decoder with past models have fixed sequence length of 1
+        # To keep these models compatible we set this dimension to dynamic
+        if input_dims["input_ids"][1] == 1:
+            input_dims["input_ids"][1] = "sequence_length"
+            output_dims["logits"][1] = "sequence_length"
+            override_dims = True
+
+        # Since https://github.com/huggingface/optimum/pull/871/
+        # changed axis notation/naming during export, we need to update the dims
+        for input_name in input_dims.keys():
+            if "past" in input_name and input_dims[input_name][2] == "past_sequence_length + sequence_length":
+                input_dims[input_name][2] = "past_sequence_length"
+                override_dims = True
+
+        if override_dims:
+            # this is kinda dangerous, warning the user is the least we can do
+            logger.warning(
+                "The ONNX model was probably exported with an older version of optimum. "
+                "We are updating the input/output dimensions and overwriting the model file "
+                "with new dimensions. This is necessary for the model to work correctly with "
+                "the current version of optimum. If you encounter any issues, please re-export "
+                "the model with the latest version of optimum for optimal performance."
+            )
+            onnx_model = update_model_dims.update_inputs_outputs_dims(onnx_model, input_dims, output_dims)
+            onnx.save(
+                onnx_model,
+                str(model_cache_path),
+                save_as_external_data=model_uses_external_data,
+                location=model_cache_path.name + "_data",
+                all_tensors_to_one_file=True,
+                convert_attribute=True,
+                size_threshold=0,
+            )
+
+        # Since transformers 4.44, the bloom model has been updated to use the standard cache format
+        use_old_bloom_modeling = not is_transformers_version(">=", "4.44")
+        for input_name in input_dims.keys():
+            if input_dims[input_name][0] == "batch_size x num_heads":
+                use_old_bloom_modeling = True
+
+        del onnx_model
+
+        model = ORTModel.load_model(
+            model_cache_path,
+            provider=provider,
+            session_options=session_options,
+            provider_options=provider_options,
+        )
+
+        if config.model_type == "bloom" and use_old_bloom_modeling:
+            init_cls = ORTBloomForCausalLM
+        elif config.model_type == "falcon":
+            init_cls = ORTFalconForCausalLM
+        elif config.model_type == "mpt":
+            init_cls = ORTMPTForCausalLM
+        # if model was exported with position_ids it means the model was exported with transformers >= v4.46
+        elif config.model_type == "opt" and "position_ids" not in input_dims:
+            init_cls = ORTOPTForCausalLM
+        elif config.model_type == "gpt_bigcode":
+            init_cls = ORTGPTBigCodeForCausalLM
+        else:
+            init_cls = ORTModelForCausalLM
+
+        if generation_config is None:
+            try:
+                generation_config = GenerationConfig.from_pretrained(
+                    model_id,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                )
+            except OSError:
+                logger.info(
+                    "Generation config file not found, using a generation config created from the model config."
+                )
+
+        return init_cls(
+            model=model,
+            config=config,
+            use_io_binding=use_io_binding,
+            model_save_dir=model_save_dir,
+            preprocessors=preprocessors,
+            use_cache=use_cache,
+            generation_config=generation_config,
+        )
+
+    @classmethod
+    def _from_transformers(
+        cls,
+        model_id: str,
+        config: "PretrainedConfig",
+        token: Optional[Union[bool, str]] = None,
+        revision: str = "main",
+        force_download: bool = True,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
+        subfolder: str = "",
+        local_files_only: bool = False,
+        trust_remote_code: bool = False,
+        use_cache: bool = True,
+        use_merged: bool = False,
+        provider: str = "CPUExecutionProvider",
+        session_options: Optional[onnxruntime.SessionOptions] = None,
+        provider_options: Optional[Dict[str, Any]] = None,
+        use_io_binding: Optional[bool] = None,
+        task: Optional[str] = None,
+    ) -> "ORTModelForCausalLM":
+        file_name = ONNX_WEIGHTS_NAME
+
+        if use_merged:
+            logger.warning("The `use_merged` argument is deprecated when the model is exported, and not used anymore.")
+            use_merged = False
+
+        if task is None:
+            task = cls._auto_model_to_task(cls.auto_model_class)
+
+            if use_cache:
+                task += "-with-past"
+
+        save_dir = TemporaryDirectory()
+        save_dir_path = Path(save_dir.name)
+
+        main_export(
+            model_name_or_path=model_id,
+            output=save_dir_path,
+            task=task,
+            do_validation=False,
+            no_post_process=False,
+            legacy=False,
+            subfolder=subfolder,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+            local_files_only=local_files_only,
+            force_download=force_download,
+            trust_remote_code=trust_remote_code,
+        )
+        maybe_save_preprocessors(model_id, save_dir_path, src_subfolder=subfolder)
+
+        return cls._from_pretrained(
+            save_dir_path,
+            config,
+            use_cache=use_cache,
+            use_merged=use_merged,
+            provider=provider,
+            session_options=session_options,
+            provider_options=provider_options,
+            use_io_binding=use_io_binding,
+            model_save_dir=save_dir,
+            file_name=file_name,
+        )
 
     # Adapted from transformers.models.gpt2.modeling_gpt2.GPT2LMHeadModel.prepare_inputs_for_generation
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
 
-        attention_mask = kwargs.get("attention_mask", None)  # input_ids.new_ones(input_ids.shape)
+        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+        attention_mask = kwargs.get("attention_mask", None)
         use_cache = kwargs.get("use_cache", None)
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
 
         return {
             "input_ids": input_ids,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "use_cache": use_cache,
-            "position_ids": None,
+            "position_ids": position_ids,
             "attention_mask": attention_mask,
-            "token_type_ids": None,
         }
 
     # Copied from transformers.models.gpt2.modeling_gpt2.GPT2LMHeadModel._reorder_cache
@@ -665,3 +705,245 @@ class ORTModelForCausalLM(ORTModelDecoder, GenerationMixin):
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
             for layer_past in past
         )
+
+    def _save_pretrained(self, save_directory: Union[str, Path]):
+        super()._save_pretrained(save_directory)
+        self.generation_config.save_pretrained(save_directory)
+
+
+class ORTGPTBigCodeForCausalLM(ORTModelForCausalLM):
+    # Adapted from transformers.models.gpt_bigcode.modeling_gpt_bigcode.GPTBigCodeForCausalLM.prepare_inputs_for_generation
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        # Omit tokens covered by past_key_values
+        if past_key_values:
+            if self.config.multi_query:
+                past_length = past_key_values[0].shape[1]
+            else:
+                past_length = past_key_values[0].shape[2]
+
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
+
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+        else:
+            position_ids = None
+
+        model_inputs = {"input_ids": input_ids}
+        model_inputs.update(
+            {
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    # Copied from transformers.models.gpt_bigcode.modeling_gpt_bigcode.GPTBigCodeForCausalLM._reorder_cache
+    @staticmethod
+    def _reorder_cache(
+        past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+    ) -> Tuple[Tuple[torch.Tensor]]:
+        return tuple(layer_past.index_select(0, beam_idx.to(layer_past.device)) for layer_past in past_key_values)
+
+
+class ORTBloomForCausalLM(ORTModelForCausalLM):
+    # Adapted from transformers.models.bloom.modeling_bloom.BloomForCausalLM.prepare_inputs_for_generation
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        attention_mask = kwargs.get("attention_mask", None)
+        use_cache = kwargs.get("use_cache", None)
+
+        # only last token for input_ids if past is not None
+        if past_key_values:
+            # the cache may be in the stardard format (e.g. in contrastive search), convert to bloom's format if needed
+            if past_key_values[0][0].shape[0] == input_ids.shape[0]:
+                past_key_values = bloom_convert_to_bloom_cache(past_key_values)
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "position_ids": None,
+            "attention_mask": attention_mask,
+        }
+
+    # Adapted from transformers.models.bloom.modeling_bloom.BloomForCausalLM._reorder_cache
+    @staticmethod
+    def _reorder_cache(past: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
+        standardized_past = bloom_convert_to_standard_cache(past, batch_size=len(beam_idx))
+
+        # Get a copy of `beam_idx` on all the devices where we need those indices.
+        device_to_beam_idx = {
+            past_state.device: beam_idx.to(past_state.device) for layer_past in past for past_state in layer_past
+        }
+        reordered_past = tuple(
+            (
+                layer_past[0].index_select(0, device_to_beam_idx[layer_past[0].device]),
+                layer_past[1].index_select(0, device_to_beam_idx[layer_past[0].device]),
+            )
+            for layer_past in standardized_past
+        )
+        return bloom_convert_to_bloom_cache(reordered_past)
+
+
+class ORTOPTForCausalLM(ORTModelForCausalLM):
+    # Adapted from transformers.models.gpt2.modeling_gpt2.GPT2LMHeadModel.prepare_inputs_for_generation
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        attention_mask = kwargs.get("attention_mask", None)
+        use_cache = kwargs.get("use_cache", None)
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "position_ids": None,
+            "attention_mask": attention_mask,
+        }
+
+
+class ORTMPTForCausalLM(ORTModelForCausalLM):
+    # Adapted from transformers.models.gpt2.modeling_gpt2.GPT2LMHeadModel.prepare_inputs_for_generation
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        attention_mask = kwargs.get("attention_mask", None)
+        use_cache = kwargs.get("use_cache", None)
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "position_ids": None,
+            "attention_mask": attention_mask,
+        }
+
+
+class ORTFalconForCausalLM(ORTModelForCausalLM):
+    def __init__(
+        self,
+        model: onnxruntime.InferenceSession,
+        config: "PretrainedConfig",
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        preprocessors: Optional[List] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model=model,
+            config=config,
+            use_io_binding=use_io_binding,
+            model_save_dir=model_save_dir,
+            preprocessors=preprocessors,
+            generation_config=generation_config,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        self.num_key_value_heads = (
+            config.num_kv_heads if (config.new_decoder_architecture or not config.multi_query) else 1
+        )
+        self.use_alibi = config.alibi
+
+    # Copied from transformers.models.falcon.modeling_falcon.FalconForCausalLM._reorder_cache
+    def _reorder_cache(
+        self, past: Tuple[Tuple[torch.Tensor, torch.Tensor], ...], beam_idx: torch.LongTensor
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+        """
+        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
+        [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
+        beam_idx at every generation step.
+
+        Output shares the same memory storage as `past`.
+        """
+
+        # Get a copy of `beam_idx` on all the devices where we need those indices.
+        device_to_beam_idx = {
+            past_state.device: beam_idx.to(past_state.device) for layer_past in past for past_state in layer_past
+        }
+        reordered_past = tuple(
+            (
+                layer_past[0].index_select(0, device_to_beam_idx[layer_past[0].device]),
+                layer_past[1].index_select(0, device_to_beam_idx[layer_past[0].device]),
+            )
+            for layer_past in past
+        )
+        return reordered_past
+
+    # Adapted from transformers.models.falcon.modeling_falcon.FalconForCausalLM.prepare_inputs_for_generation
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> dict:
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        # Note: versions of Falcon with alibi do not use position_ids. It is used with RoPE.
+        if not self.use_alibi and attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        return {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
+        }

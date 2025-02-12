@@ -1,3 +1,18 @@
+# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import platform
 from dataclasses import field
 from enum import Enum
@@ -244,8 +259,8 @@ class Run(_RunDefaults, _RunBase):
         # validate `task_args`
         if self.task == "text-classification":
             message = "For text classification, whether the task is regression should be explicity specified in the task_args.is_regression key."
-            assert self.task_args != None, message
-            assert self.task_args["is_regression"] != None, message
+            assert self.task_args is not None, message
+            assert self.task_args["is_regression"] is not None, message
 
         # validate `dataset`
         if self.quantization_approach == "static":
@@ -260,7 +275,7 @@ class Run(_RunDefaults, _RunBase):
             ), "Calibration parameters should be passed for static quantization in the calibration key."
 
         # validate `aware_training`
-        assert self.aware_training == False, "Quantization-Aware Training not supported."
+        assert self.aware_training is False, "Quantization-Aware Training not supported."
 
 
 @generate_doc_dataclass

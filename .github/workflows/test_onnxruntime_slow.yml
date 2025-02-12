@@ -1,0 +1,50 @@
+name: ONNX Runtime Slow / Python - Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: 0 7 * * * # every day at 7am UTC
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - labeled
+      - reopened
+      - unlabeled
+      - synchronize
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: ${{
+      (github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch') ||
+      contains(github.event.pull_request.labels.*.name, 'slow') ||
+      contains(github.event.pull_request.labels.*.name, 'onnxruntime-slow')
+      }}
+
+    runs-on:
+      group: aws-general-8-plus
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install .[tests,onnxruntime,diffusers]
+
+      - name: Test with pytest
+        run: |
+          RUN_SLOW=1 pytest tests/onnxruntime -m "run_slow" --durations=0 -vvvv

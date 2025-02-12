@@ -12,15 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import tempfile
 import unittest
 
-from transformers.testing_utils import TOKEN, USER, is_staging_test
-
-from huggingface_hub import HfFolder, delete_repo, set_access_token
-from optimum.configuration_utils import BaseConfig
+from huggingface_hub import HfFolder, delete_repo
 from requests.exceptions import HTTPError
+from transformers.testing_utils import TOKEN, TemporaryHubRepo, is_staging_test
+
+from optimum.configuration_utils import BaseConfig
 
 
 class FakeConfig(BaseConfig):
@@ -48,7 +47,6 @@ class ConfigPushToHubTester(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._token = TOKEN
-        set_access_token(TOKEN)
         HfFolder.save_token(TOKEN)
 
     @classmethod
@@ -70,12 +68,11 @@ class ConfigPushToHubTester(unittest.TestCase):
 
     def test_push_to_hub(self):
         config = FakeConfig(attribute=15)
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config.save_pretrained(
-                os.path.join(tmp_dir, "optimum-test-base-config"), push_to_hub=True, use_auth_token=self._token
-            )
 
-            new_config = FakeConfig.from_pretrained(f"{USER}/optimum-test-base-config")
+        with TemporaryHubRepo(token=self._token) as tmp_repo:
+            config.push_to_hub(tmp_repo.repo_id, token=self._token)
+
+            new_config = FakeConfig.from_pretrained(tmp_repo.repo_id)
             for k, v in config.to_dict().items():
                 if k != "optimum_version" and k != "transformers_version":
                     self.assertEqual(v, getattr(new_config, k))
@@ -83,15 +80,9 @@ class ConfigPushToHubTester(unittest.TestCase):
     def test_push_to_hub_in_organization(self):
         config = FakeConfig(attribute=15)
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config.save_pretrained(
-                os.path.join(tmp_dir, "optimum-test-base-config-org"),
-                push_to_hub=True,
-                use_auth_token=self._token,
-                organization="valid_org",
-            )
-
-            new_config = FakeConfig.from_pretrained("valid_org/optimum-test-base-config-org")
+        with TemporaryHubRepo(namespace="valid_org", token=self._token) as tmp_repo:
+            config.push_to_hub(tmp_repo.repo_id, token=self._token)
+            new_config = FakeConfig.from_pretrained(tmp_repo.repo_id)
             for k, v in config.to_dict().items():
                 if k != "optimum_version" and k != "transformers_version":
                     self.assertEqual(v, getattr(new_config, k))
