@@ -11,8 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
 import torch
-import torch.nn as nn
+
+from ...utils import logging, recurse_getattr, recurse_setattr
 
 
 KNOWN_ACTIVATION_ATTRIBUTES = ["hidden_act", "activation", "act_fn", "activation_function"]
@@ -20,11 +27,25 @@ KNOWN_POS_EMB_ATTRIBUTES = ["position_embedding_type"]
 KNOWN_NUM_LAYERS = ["num_hidden_layers", "num_layers", "encoder_layers", "n_layers"]
 
 SUPPORTED_ACTIVATION_FUNCTIONS = ["gelu", "relu", "gelu_new"]
+USE_AT_OWN_RISK_ACTIVATION_FUNCTIONS = ["quick_gelu"]
 
 
-class BetterTransformerBaseLayer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
+logger = logging.get_logger(__name__)
+
+
+class BetterTransformerBaseLayer:
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+    ):
+        r"""
+        Base layer for `BetterTransformer` integration. This class is used to wrap all the necessary
+        components for the `BetterTransformer` integration.
+
+        Args:
+            config (`transformers.PretrainedConfig`):
+                The config of the model.
+        """
         self.norm_first = False
         self.use_gelu = False
         self.act_fn = None
@@ -32,12 +53,21 @@ class BetterTransformerBaseLayer(nn.Module):
         self.num_heads = None
         self.embed_dim = None
         self.num_layers = None
+        self.original_layers_mapping = {}
+        self.module_mapping = None
+        # Some models does not have some attributes thus needs to be ignored
+        # e.g. whisper does not have self_attn.k_proj.bias but has self_attn.v_proj.bias & self_attn.q_proj.bias
+        self.keys_to_ignore = []
 
         # Get activation function
         for attr in KNOWN_ACTIVATION_ATTRIBUTES:
             if hasattr(config, attr):
                 self.act_fn = getattr(config, attr)
                 break
+
+        # if act_fn not found in the config, fall back to the private `_get_activation_function` if available
+        if self.act_fn is None and hasattr(self, "_get_activation_function"):
+            self.act_fn = self._get_activation_function(config)
 
         # Get pos emb type
         for attr in KNOWN_POS_EMB_ATTRIBUTES:
@@ -77,7 +107,12 @@ class BetterTransformerBaseLayer(nn.Module):
             raise ValueError("norm1_eps and norm2_eps must be equal for `BetterTransformer` integration.")
 
         # Check activation function
-        if self.act_fn not in SUPPORTED_ACTIVATION_FUNCTIONS:
+        if self.act_fn in USE_AT_OWN_RISK_ACTIVATION_FUNCTIONS:
+            logger.warning(
+                f"Overridding {self.act_fn} activation with gelu. Use the transformed model at your own risk, the output logits could be significantly different."
+            )
+            self.act_fn = "gelu"
+        elif self.act_fn not in SUPPORTED_ACTIVATION_FUNCTIONS:
             raise ValueError(
                 f"Activation function {self.act_fn} not supported" " for `BetterTransformer` integration."
             )
@@ -91,12 +126,47 @@ class BetterTransformerBaseLayer(nn.Module):
                 f" Number of heads must be even."
             )
 
-    def forward_checker(self, *args, **kwargs):
-        if torch.is_autocast_enabled() or torch.is_autocast_cpu_enabled():
-            raise ValueError("Autocast is not supported for `BetterTransformer` integration.")
+    def _revert(self, module: torch.nn.Module) -> torch.nn.Module:
+        if self.module_mapping is not None:
+            if "" in self.module_mapping.values():
+                for bt_module_attr_name, value in self.module_mapping.items():
+                    if value == "":
+                        module = getattr(self, bt_module_attr_name)
+                        return module
+            else:
+                raise NotImplementedError("replacing a submodule in revert is not supported")
 
-        if self.training:
-            raise ValueError(
-                "Training is not supported for `BetterTransformer` integration.",
-                " Please use `model.eval()` before running the model.",
-            )
+        for modified_layer_key_names, original_layer_key_names in self.original_layers_mapping.items():
+            if isinstance(original_layer_key_names, list):
+                current_weight = getattr(self, modified_layer_key_names)
+
+                # Split the current weight n chunks - this is useful to split
+                # the qkv layers into q, k, v layers for example.
+                split_index = current_weight.shape[0] // len(original_layer_key_names)
+                for i, subparam_name in enumerate(original_layer_key_names):
+                    if recurse_getattr(module, subparam_name) is None:
+                        # this is for example the case if bias=False is set for a nn.Linear layer
+                        continue
+
+                    if module not in self.keys_to_ignore:
+                        # TODO: remove the clone once https://github.com/huggingface/transformers/pull/27314 & https://github.com/huggingface/safetensors/pull/379 are released.
+                        # Safetensors is bugged when using views of tensors.
+                        parameter = current_weight[i * split_index : (i + 1) * split_index].clone()
+                        if isinstance(recurse_getattr(module, subparam_name), torch.nn.Parameter):
+                            parameter = torch.nn.Parameter(parameter)
+                        recurse_setattr(module, subparam_name, parameter)
+            elif isinstance(original_layer_key_names, str):
+                if recurse_getattr(module, original_layer_key_names) is None:
+                    # this is for example the case if bias=False is set for a nn.Linear layer
+                    continue
+
+                parameter = getattr(self, modified_layer_key_names)
+                if isinstance(recurse_getattr(module, original_layer_key_names), torch.nn.Parameter):
+                    parameter = torch.nn.Parameter(parameter)
+                recurse_setattr(module, original_layer_key_names, parameter)
+            else:
+                raise ValueError(
+                    f"Invalid type {type(modified_layer_key_names)} for `original_layers_mapping`",
+                    " please use either `str` or `list`.",
+                )
+        return module

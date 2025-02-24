@@ -22,7 +22,6 @@ import os
 import sys
 from dataclasses import dataclass, field
 from functools import partial
-from pathlib import Path
 from typing import Optional
 
 import datasets
@@ -30,16 +29,14 @@ import numpy as np
 import torch
 import transformers
 from datasets import load_dataset
-from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
-from transformers import AutoFeatureExtractor, EvalPrediction, HfArgumentParser, TrainingArguments
-from transformers.onnx import FeaturesManager
-from transformers.utils.versions import require_version
-
 from evaluate import load
 from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
+from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
+from transformers import AutoFeatureExtractor, EvalPrediction, HfArgumentParser, TrainingArguments
+from transformers.utils.versions import require_version
+
 from optimum.onnxruntime import ORTQuantizer
 from optimum.onnxruntime.configuration import AutoCalibrationConfig, QuantizationConfig
-from optimum.onnxruntime.model import ORTModel
 from optimum.onnxruntime.modeling_ort import ORTModelForImageClassification
 from optimum.onnxruntime.preprocessors import QuantizationPreprocessor
 from optimum.onnxruntime.preprocessors.passes import (
@@ -48,6 +45,7 @@ from optimum.onnxruntime.preprocessors.passes import (
     ExcludeNodeAfter,
     ExcludeNodeFollowedBy,
 )
+from optimum.onnxruntime.utils import evaluation_loop
 
 
 logger = logging.getLogger(__name__)
@@ -294,7 +292,7 @@ def main():
         return result
 
     # Export the model
-    model = ORTModelForImageClassification.from_pretrained(model_args.model_name_or_path, from_transformers=True)
+    model = ORTModelForImageClassification.from_pretrained(model_args.model_name_or_path, export=True)
 
     # Create the quantizer
     quantizer = ORTQuantizer.from_pretrained(model)
@@ -379,12 +377,15 @@ def main():
         quantization_preprocessor.register_pass(ExcludeNodeFollowedBy("Add", "Softmax"))
 
     # Apply quantization on the model
-    quantizer.quantize(
+    quantized_model_path = quantizer.quantize(
         save_dir=training_args.output_dir,
         calibration_tensors_range=ranges,
         quantization_config=qconfig,
         preprocessor=quantization_preprocessor,
         use_external_data_format=onnx_export_args.use_external_data_format,
+    )
+    model = ORTModelForImageClassification.from_pretrained(
+        quantized_model_path, provider=optim_args.execution_provider
     )
 
     # Evaluation
@@ -399,7 +400,7 @@ def main():
             eval_dataset = eval_dataset.align_labels_with_mapping(
                 label2id=model.config.label2id, label_column=labels_column
             )
-        except Exception as e:
+        except Exception:
             logger.warning(
                 f"\nModel label mapping: {model.config.label2id}"
                 f"\nDataset label features: {eval_dataset.features[labels_column]}"
@@ -410,15 +411,14 @@ def main():
         # Set the validation transforms
         eval_dataset = eval_dataset.with_transform(preprocess_function)
 
-        ort_model = ORTModel(
-            Path(training_args.output_dir) / "model_quantized.onnx",
-            execution_provider=optim_args.execution_provider,
-            compute_metrics=compute_metrics,
+        outputs = evaluation_loop(
+            model=model,
+            dataset=eval_dataset,
             label_names=[labels_column],
+            compute_metrics=compute_metrics,
         )
-        outputs = ort_model.evaluation_loop(eval_dataset)
         # Save metrics
-        with open(os.path.join(training_args.output_dir, f"eval_results.json"), "w") as f:
+        with open(os.path.join(training_args.output_dir, "eval_results.json"), "w") as f:
             json.dump(outputs.metrics, f, indent=4, sort_keys=True)
 
 

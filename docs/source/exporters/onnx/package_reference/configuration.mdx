@@ -32,12 +32,15 @@ They specify which input generators should be used for the dummy inputs, but rem
 
 ## Base classes
 
-[[autodoc]] exporters.onnx.base.OnnxConfig
+[[autodoc]] exporters.onnx.OnnxConfig
+    - inputs
+    - outputs
+    - generate_dummy_inputs
 
-[[autodoc]] exporters.onnx.base.OnnxConfigWithPast
+[[autodoc]] exporters.onnx.OnnxConfigWithPast
+    - add_past_key_values
 
-[[autodoc]] exporters.onnx.base.OnnxSeq2SeqConfigWithPast
-
+[[autodoc]] exporters.onnx.OnnxSeq2SeqConfigWithPast
 
 ## Middle-end classes
 
@@ -58,57 +61,3 @@ They specify which input generators should be used for the dummy inputs, but rem
 ### Multi-modal
 
 [[autodoc]] exporters.onnx.config.TextAndVisionOnnxConfig
-
-## Supported architectures
-
-- Albert
-- Bart
-- Beit
-- Bert
-- BigBird
-- BigBirdPegasus
-- BigBirdSmall
-- BlenderBot
-- Bloom
-- CLIP
-- Camembert
-- CodeGen
-- ConvBert
-- ConvNext
-- Data2VecText
-- Data2VecVision
-- Deberta
-- Deberta-v2
-- Deit
-- Detr
-- DistilBert
-- Electra
-- Flaubert
-- GPT-2
-- GPT-J
-- GPT-Neo
-- GroupVit
-- IBert
-- LayoutLM
-- LayoutLM-v3
-- Levit
-- LongT5
-- M2-M100
-- MBart
-- MT5
-- Marian
-- MobileBert
-- MobileVit
-- OwlVit
-- Perceiver
-- ResNet
-- Roberta
-- Roformer
-- Segformer
-- SqueezeBert
-- T5
-- Vit
-- Whisper
-- XLM
-- XLM-Roberta
-- Yolos

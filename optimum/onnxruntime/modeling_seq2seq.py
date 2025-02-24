@@ -17,38 +17,64 @@ Transformers.
 """
 
 import logging
-import os
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
-from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoModelForSpeechSeq2Seq, AutoTokenizer
-from transformers.file_utils import add_start_docstrings_to_model_forward, default_cache_path
-from transformers.generation_utils import GenerationMixin
+from huggingface_hub import hf_hub_download
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoModelForSpeechSeq2Seq,
+    AutoModelForVision2Seq,
+    GenerationConfig,
+    Pix2StructForConditionalGeneration,
+    WhisperForConditionalGeneration,
+)
+from transformers.file_utils import add_end_docstrings, add_start_docstrings_to_model_forward
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
-from transformers.onnx import FeaturesManager, export
+from transformers.models.auto.modeling_auto import MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES
 
 import onnxruntime as ort
-from huggingface_hub import hf_hub_download
 
-from ..exporters.onnx.model_configs import SpeechSeq2SeqDecoderOnnxConfig, SpeechSeq2SeqEncoderOnnxConfig
-from ..onnx.configuration import DecoderOnnxConfig, EncoderOnnxConfig
-from ..onnx.modeling_seq2seq import _DecoderWithLMhead
-from .io_binding import TypeHelper
-from .modeling_ort import ORTModel
+from ..exporters.onnx import main_export
+from ..onnx.utils import _get_external_data_paths
+from ..utils import is_transformers_version
+from ..utils.file_utils import validate_file_exists
+from ..utils.save_utils import maybe_load_preprocessors, maybe_save_preprocessors
+from .base import ORTDecoderForSeq2Seq, ORTEncoder
+from .constants import (
+    DECODER_MERGED_ONNX_FILE_PATTERN,
+    DECODER_ONNX_FILE_PATTERN,
+    DECODER_WITH_PAST_ONNX_FILE_PATTERN,
+    ENCODER_ONNX_FILE_PATTERN,
+)
+from .modeling_ort import ONNX_MODEL_END_DOCSTRING, ORTModel
 from .utils import (
     ONNX_DECODER_NAME,
     ONNX_DECODER_WITH_PAST_NAME,
     ONNX_ENCODER_NAME,
-    ORTConfigManager,
-    get_device_for_provider,
     get_provider_for_device,
     parse_device,
     validate_provider_availability,
 )
+
+
+if is_transformers_version(">=", "4.25.0"):
+    from transformers.generation import GenerationMixin
+else:
+    from transformers.generation_utils import GenerationMixin  # type: ignore
+
+
+if is_transformers_version(">=", "4.43.0"):
+    from transformers.cache_utils import EncoderDecoderCache
+else:
+    EncoderDecoderCache = dict
+
+from huggingface_hub.utils import EntryNotFoundError
 
 
 if TYPE_CHECKING:
@@ -67,12 +93,25 @@ SEQ2SEQ_ENCODER_INPUTS_DOCSTRING = r"""
             `(batch_size, encoder_sequence_length)`. Mask values selected in `[0, 1]`.
 """
 
-WHISPER_ENCODER_INPUTS_DOCSTRING = r"""
+SPEECH_ENCODER_INPUTS_DOCSTRING = r"""
     Args:
         input_features (`torch.FloatTensor`):
-            Mel features extracted from the raw speech waveform. `(batch_size, feature_size, encoder_sequence_length)`.
+            Mel / fbank features extracted from the raw speech waveform. `(batch_size, feature_size, encoder_sequence_length)`.
 """
 
+VISION_ENCODER_INPUTS_DOCSTRING = r"""
+    Args:
+        pixel_values (`torch.FloatTensor`):
+            Features extracted from an Image. This tensor should be of shape `(batch_size, num_channels, height, width)`.
+"""
+
+PIX2STRUCT_INPUTS_DOCSTRING = r"""
+    Args:
+        flattened_patches (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_channels x patch_height x patch_width)`):
+            Flattened and padded pixel values.
+        attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
+            Mask to avoid performing attention on padding pixel values.
+"""
 
 DECODER_INPUTS_DOCSTRING = r"""
     Args:
@@ -82,7 +121,7 @@ DECODER_INPUTS_DOCSTRING = r"""
             The encoder `last_hidden_state` of shape `(batch_size, encoder_sequence_length, hidden_size)`.
         encoder_attention_mask (`torch.LongTensor`, *optional*):
             Mask to avoid performing cross-attention on padding tokens indices of encoder `input_ids`.
-        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*)`
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
             Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
             The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
             `(batch_size, num_heads, decoder_sequence_length, embed_size_per_head)` and 2 additional tensors of shape
@@ -100,13 +139,12 @@ SEQ2SEQ_ONNX_MODEL_DOCSTRING = r"""
             Indices of decoder input sequence tokens in the vocabulary of shape `(batch_size, decoder_sequence_length)`.
         encoder_outputs (`torch.FloatTensor`):
             The encoder `last_hidden_state` of shape `(batch_size, encoder_sequence_length, hidden_size)`.
-        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*)`
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
             Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
             The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
             `(batch_size, num_heads, decoder_sequence_length, embed_size_per_head)` and 2 additional tensors of shape
             `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
 """
-
 
 SPEECH_SEQ2SEQ_ONNX_MODEL_DOCSTRING = r"""
     Args:
@@ -117,7 +155,50 @@ SPEECH_SEQ2SEQ_ONNX_MODEL_DOCSTRING = r"""
             Indices of decoder input sequence tokens in the vocabulary of shape `(batch_size, decoder_sequence_length)`.
         encoder_outputs (`torch.FloatTensor`):
             The encoder `last_hidden_state` of shape `(batch_size, encoder_sequence_length, hidden_size)`.
-        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*)`
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
+            Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
+            The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, decoder_sequence_length, embed_size_per_head)` and 2 additional tensors of shape
+            `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
+"""
+
+VISION_ENCODER_DECODER_SEQ2SEQ_ONNX_MODEL_DOCSTRING = r"""
+    Args:
+        pixel_values (`torch.FloatTensor`):
+            Features extracted from an Image. This tensor should be of shape
+            `(batch_size, num_channels, height, width)`.
+        decoder_input_ids (`torch.LongTensor`):
+            Indices of decoder input sequence tokens in the vocabulary of shape `(batch_size, decoder_sequence_length)`.
+        encoder_outputs (`torch.FloatTensor`):
+            The encoder `last_hidden_state` of shape `(batch_size, encoder_sequence_length, hidden_size)`.
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
+            Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
+            The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, decoder_sequence_length, embed_size_per_head)` and 2 additional tensors of shape
+            `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
+"""
+
+PIX2STRUCT_ONNX_MODEL_DOCSTRING = r"""
+    Args:
+        flattened_patches (`torch.FloatTensor` of shape `(batch_size, seq_length, hidden_size)`):
+            Flattened pixel patches. the `hidden_size` is obtained by the following formula: `hidden_size` =
+            `num_channels` * `patch_size` * `patch_size`
+            The process of flattening the pixel patches is done by `Pix2StructProcessor`.
+        attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices.
+        decoder_input_ids (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
+            Indices of decoder input sequence tokens in the vocabulary.
+            Pix2StructText uses the `pad_token_id` as the starting token for `decoder_input_ids` generation. If
+            `past_key_values` is used, optionally only the last `decoder_input_ids` have to be input (see
+            `past_key_values`).
+        decoder_attention_mask (`torch.BoolTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
+            Default behavior: generate a tensor that ignores pad tokens in `decoder_input_ids`. Causal mask will also
+            be used by default.
+        encoder_outputs (`tuple(tuple(torch.FloatTensor)`, *optional*):
+            Tuple consists of (`last_hidden_state`, `optional`: *hidden_states*, `optional`: *attentions*)
+            `last_hidden_state` of shape `(batch_size, sequence_length, hidden_size)` is a sequence of hidden states at
+            the output of the last layer of the encoder. Used in the cross-attention of the decoder.
+        past_key_values (`tuple(tuple(torch.FloatTensor), *optional*, defaults to `None`)`
             Contains the precomputed key and value hidden states of the attention blocks used to speed up decoding.
             The tuple is of length `config.n_layers` with each tuple having 2 tensors of shape
             `(batch_size, num_heads, decoder_sequence_length, embed_size_per_head)` and 2 additional tensors of shape
@@ -126,6 +207,7 @@ SPEECH_SEQ2SEQ_ONNX_MODEL_DOCSTRING = r"""
 
 _TOKENIZER_FOR_DOC = "AutoTokenizer"
 _PROCESSOR_FOR_DOC = "AutoProcessor"
+_IMAGE_PROCESSER_FOR_DOC = "AutoImageProcessor"
 
 TRANSLATION_EXAMPLE = r"""
     Example of text generation:
@@ -180,7 +262,7 @@ AUTOMATIC_SPEECH_RECOGNITION_EXAMPLE = r"""
     Example using `transformers.pipeline`:
 
     ```python
-    >>> from transformers import {processor_class}
+    >>> from transformers import {processor_class}, pipeline
     >>> from optimum.onnxruntime import {model_class}
     >>> from datasets import load_dataset
 
@@ -194,6 +276,206 @@ AUTOMATIC_SPEECH_RECOGNITION_EXAMPLE = r"""
 """
 
 
+IMAGE_TO_TEXT_EXAMPLE = r"""
+    Example of text generation:
+
+    ```python
+    >>> from transformers import {processor_class}, {tokenizer_class}
+    >>> from optimum.onnxruntime import {model_class}
+    >>> from PIL import Image
+    >>> import requests
+
+
+    >>> processor = {processor_class}.from_pretrained("{checkpoint}")
+    >>> tokenizer = {tokenizer_class}.from_pretrained("{checkpoint}")
+    >>> model = {model_class}.from_pretrained("{checkpoint}", export=True)
+
+    >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+    >>> image = Image.open(requests.get(url, stream=True).raw)
+    >>> inputs = processor(image, return_tensors="pt")
+
+    >>> gen_tokens = model.generate(**inputs)
+    >>> outputs = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
+
+    ```
+
+    Example using `transformers.pipeline`:
+
+    ```python
+    >>> from transformers import {processor_class}, {tokenizer_class}, pipeline
+    >>> from optimum.onnxruntime import {model_class}
+    >>> from PIL import Image
+    >>> import requests
+
+
+    >>> processor = {processor_class}.from_pretrained("{checkpoint}")
+    >>> tokenizer = {tokenizer_class}.from_pretrained("{checkpoint}")
+    >>> model = {model_class}.from_pretrained("{checkpoint}", export=True)
+
+    >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+    >>> image = Image.open(requests.get(url, stream=True).raw)
+
+    >>> image_to_text = pipeline("image-to-text", model=model, tokenizer=tokenizer, feature_extractor=processor, image_processor=processor)
+    >>> pred = image_to_text(image)
+    ```
+"""
+
+PIX2STRUCT_EXAMPLE = r"""
+    Example of pix2struct:
+
+    ```python
+    >>> from transformers import {processor_class}
+    >>> from optimum.onnxruntime import {model_class}
+    >>> from PIL import Image
+    >>> import requests
+
+    >>> processor = {processor_class}.from_pretrained("{checkpoint}")
+    >>> model = {model_class}.from_pretrained("{checkpoint}", export=True, use_io_binding=True)
+
+    >>> url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/ai2d-demo.jpg"
+    >>> image = Image.open(requests.get(url, stream=True).raw)
+    >>> question = "What does the label 15 represent? (1) lava (2) core (3) tunnel (4) ash cloud"
+    >>> inputs = processor(images=image, text=question, return_tensors="pt")
+
+    >>> gen_tokens = model.generate(**inputs)
+    >>> outputs = processor.batch_decode(gen_tokens, skip_special_tokens=True)
+    ```
+"""
+
+
+class ORTEncoderForSpeech(ORTEncoder):
+    """
+    Encoder model for ONNX Runtime inference for Whisper model.
+
+    Args:
+        session (`ort.InferenceSession`):
+            The ONNX Runtime inference session associated to the encoder.
+    """
+
+    @add_start_docstrings_to_model_forward(SPEECH_ENCODER_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_features: torch.FloatTensor,
+        attention_mask: torch.LongTensor,
+        **kwargs,
+    ) -> BaseModelOutput:
+        use_torch = isinstance(input_features, torch.Tensor)
+        self.parent_model.raise_on_numpy_input_io_binding(use_torch)
+
+        model_inputs = {
+            "input_features": input_features,
+            "attention_mask": attention_mask,
+        }
+
+        if self.parent_model.use_io_binding:
+            io_binding, output_shapes, output_buffers = self._prepare_io_binding(self.session, model_inputs)
+
+            if self.device.type == "cpu":
+                self.session.run_with_iobinding(io_binding)
+            else:
+                io_binding.synchronize_inputs()
+                self.session.run_with_iobinding(io_binding)
+                io_binding.synchronize_outputs()
+
+            last_hidden_state = output_buffers["last_hidden_state"].view(output_shapes["last_hidden_state"])
+        else:
+            onnx_inputs = self._prepare_onnx_inputs(use_torch, model_inputs)
+            onnx_outputs = self.session.run(None, onnx_inputs)
+            model_outputs = self._prepare_onnx_outputs(use_torch, onnx_outputs)
+
+            last_hidden_state = model_outputs["last_hidden_state"]
+
+        return BaseModelOutput(last_hidden_state=last_hidden_state)
+
+
+class ORTEncoderForVisionEncoderDecoder(ORTEncoder):
+    """
+    Encoder model for ONNX Runtime inference for VisionEncoderDecoder models.
+
+    Args:
+        session (`ort.InferenceSession`):
+            The ONNX Runtime inference session associated to the encoder.
+    """
+
+    @add_start_docstrings_to_model_forward(VISION_ENCODER_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        pixel_values: torch.FloatTensor,
+        **kwargs,
+    ) -> BaseModelOutput:
+        use_torch = isinstance(pixel_values, torch.Tensor)
+        self.parent_model.raise_on_numpy_input_io_binding(use_torch)
+
+        model_inputs = {
+            "pixel_values": pixel_values,
+        }
+
+        if self.parent_model.use_io_binding:
+            io_binding, output_shapes, output_buffers = self._prepare_io_binding(self.session, model_inputs)
+
+            if self.device.type == "cpu":
+                self.session.run_with_iobinding(io_binding)
+            else:
+                io_binding.synchronize_inputs()
+                self.session.run_with_iobinding(io_binding)
+                io_binding.synchronize_outputs()
+
+            last_hidden_state = output_buffers["last_hidden_state"].view(output_shapes["last_hidden_state"])
+        else:
+            onnx_inputs = self._prepare_onnx_inputs(use_torch, model_inputs)
+            onnx_outputs = self.session.run(None, onnx_inputs)
+            model_outputs = self._prepare_onnx_outputs(use_torch, onnx_outputs)
+
+            last_hidden_state = model_outputs["last_hidden_state"]
+
+        return BaseModelOutput(last_hidden_state=last_hidden_state)
+
+
+class ORTEncoderForPix2Struct(ORTEncoder):
+    """
+    Encoder model for ONNX Runtime inference for Pix2Struct.
+
+    Args:
+        session (`ort.InferenceSession`):
+            The ONNX Runtime inference session associated to the encoder.
+    """
+
+    @add_start_docstrings_to_model_forward(PIX2STRUCT_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        flattened_patches: torch.FloatTensor,
+        attention_mask: torch.LongTensor,
+        **kwargs,
+    ) -> BaseModelOutput:
+        use_torch = isinstance(flattened_patches, torch.Tensor)
+        self.parent_model.raise_on_numpy_input_io_binding(use_torch)
+
+        model_inputs = {
+            "flattened_patches": flattened_patches,
+            "attention_mask": attention_mask,
+        }
+
+        if self.parent_model.use_io_binding:
+            io_binding, output_shapes, output_buffers = self._prepare_io_binding(self.session, model_inputs)
+
+            if self.device.type == "cpu":
+                self.session.run_with_iobinding(io_binding)
+            else:
+                io_binding.synchronize_inputs()
+                self.session.run_with_iobinding(io_binding)
+                io_binding.synchronize_outputs()
+
+            last_hidden_state = output_buffers["last_hidden_state"].view(output_shapes["last_hidden_state"])
+        else:
+            onnx_inputs = self._prepare_onnx_inputs(use_torch, model_inputs)
+            onnx_outputs = self.session.run(None, onnx_inputs)
+            model_outputs = self._prepare_onnx_outputs(use_torch, onnx_outputs)
+
+            last_hidden_state = model_outputs["last_hidden_state"]
+
+        return BaseModelOutput(last_hidden_state=last_hidden_state)
+
+
 class ORTModelForConditionalGeneration(ORTModel, ABC):
     """
     Sequence-to-sequence model with a language modeling head for ONNX Runtime inference.
@@ -202,7 +484,7 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
         config ([`PretrainedConfig`]):
             Instance of the configuration associated to the model. Initializing with a config file does
             not load the weights associated with the model, only the configuration.
-        use_io_binding (`bool`):
+        use_io_binding (`Optional[bool]`, defaults to `None`):
             Whether use IOBinding during inference to avoid memory copy between the host and devices. Defaults to `True`
             if the device is CUDA, otherwise defaults to `False`.
         use_cache (`bool`):
@@ -212,9 +494,9 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
             The list of execution providers the model is running on.
         encoder (`ORTEncoder`):
             The encoder model.
-        decoder (`ORTDecoder`):
+        decoder (`ORTDecoderForSeq2Seq`):
             The decoder model.
-        decoder_with_past (`Optional[ORTDecoder]`):
+        decoder_with_past (`Optional[ORTDecoderForSeq2Seq]`):
             The decoder model handling the past key/values if `use_cache=True`, else `None`.
 
     Other attributes:
@@ -231,18 +513,21 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
 
     # Used in from_transformers to export model to onnxORTEncoder
     base_model_prefix = "onnx_model"
+    _supports_cache_class = False
 
     def __init__(
         self,
         encoder_session: ort.InferenceSession,
         decoder_session: ort.InferenceSession,
         config: "PretrainedConfig",
+        onnx_paths: List[str],
         decoder_with_past_session: Optional[ort.InferenceSession] = None,
-        use_io_binding: bool = True,
-        model_save_dir: str = "",
-        last_encoder_model_name: str = ONNX_ENCODER_NAME,
-        last_decoder_model_name: str = ONNX_DECODER_NAME,
-        last_decoder_with_past_model_name: str = ONNX_DECODER_WITH_PAST_NAME,
+        use_cache: bool = True,
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        preprocessors: Optional[List] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        **kwargs,
     ):
         """
         Args:
@@ -253,73 +538,128 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
             config ([`PretrainedConfig`]):
                 `config` is an instance of the configuration associated to the model. Initializing with a config file
                 does not load the weights associated with the model, only the configuration.
+            onnx_paths (`List[str]`):
+                Path to ONNX files associated with the model.
             decoder_with_past_session (`Optional[ort.InferenceSession]`, *optional*):
                 The ONNX Runtime inference session associated to the decoder with past key values.
-            use_io_binding (`bool`, *optional*, defaults to `True`):
+            use_io_binding (`bool`, *optional*, defaults to `None`):
                 Whether use IOBinding during inference to avoid memory copy between the host and devices. Defaults to
                 `True` if the device is CUDA, otherwise defaults to `False`.
             model_save_dir (`str`, *optional*, defaults to `""`):
                 The directory under which the model exported to ONNX was saved.
-            last_encoder_model_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_ENCODER_NAME`):
-                The name of the ONNX file containing the encoder part of the model.
-            last_decoder_model_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_DECODER_NAME`):
-                The name of the ONNX file containing the decoder part of the model.
-            last_decoder_with_past_model_name (`str`, *optional*, defaults to `optimum.onnxruntime.utils.ONNX_DECODER_WITH_PAST_NAME`):
-                The name of the ONNX file containing the decoder with past key/values part of the model.
+            preprocessors (`Optional[List]`, defaults to `None`):
+                The list of the preprocessors (tokenizer, processor, feature_extractor) to save alongside the ORTModel.
+            generation_config (`Optional[GenerationConfig]`, defaults to `None`):
+                The generation configuration used by default when calling `generate()`.
+                Refer to https://huggingface.co/docs/transformers/main/en/main_classes/text_generation#transformers.GenerationMixin.generate.
         """
+
+        # TODO: remove at version 2.0
+        def show_deprecated_argument(arg_name):
+            if kwargs.pop(arg_name, None) is not None:
+                logger.warning(
+                    f"The {arg_name} argument to create an {self.__class__.__name__} is deprecated, and not used "
+                    "anymore."
+                )
+
+        show_deprecated_argument("last_encoder_model_name")
+        show_deprecated_argument("last_decoder_model_name")
+        show_deprecated_argument("last_decoder_with_past_model_name")
+        if kwargs:
+            raise ValueError(
+                f"{self.__class__.__name__} received {', '.join(kwargs.keys())}, but do not accept those arguments."
+            )
+
         ABC.__init__(self)
 
-        self.encoder_file_name = last_encoder_model_name
-        self.decoder_file_name = last_decoder_model_name
-        self.decoder_file_with_past_name = last_decoder_with_past_model_name
+        if use_io_binding is None:
+            if decoder_session.get_providers()[0] == "CUDAExecutionProvider":
+                use_io_binding = True
+            else:
+                use_io_binding = False
 
+        self.shared_attributes_init(
+            encoder_session,
+            use_io_binding=use_io_binding,
+            model_save_dir=model_save_dir,
+            preprocessors=preprocessors,
+        )
         self.config = config
+        self.name_or_path = config.name_or_path
 
-        self.use_io_binding = use_io_binding
-        self.model_save_dir = model_save_dir
+        self.onnx_paths = onnx_paths
+        self.use_cache = use_cache
 
-        self.providers = encoder_session.get_providers()
-        self._device = get_device_for_provider(encoder_session.get_providers()[0])
+        if use_cache is True:
+            # Auto-detect whether the provided session is a merged non-past / with-past or not
+            # TODO: make __init__ private and pass `use_merged` as an argument
+            use_merged = "use_cache_branch" in [inp.name for inp in decoder_session.get_inputs()]
 
-        if "TensorrtExecutionProvider" in self.providers and self.use_io_binding:
-            logger.warning(
-                "There is no need to do IO binding for TensorrtExecutionProvider, `use_io_binding` will be set to False."
+            if use_merged is True and decoder_with_past_session is not None:
+                raise ValueError(
+                    "Detected a merged decoder, but decoder_with_past_session was provided."
+                    "Please only set decoder_session, or provide a non-merged decoder_session."
+                )
+            if use_cache is True and use_merged is False and decoder_with_past_session is None:
+                raise ValueError(
+                    "The parameter use_cache was set as True, but neither decoder_with_past_session was passed"
+                    " nor a use_cache branch can be found in the decoder_session."
+                    " Please pass a decoder_with_past_session or set use_cache=False."
+                )
+        else:
+            use_merged = False
+
+            if decoder_with_past_session is not None:
+                raise ValueError(
+                    "The parameter decoder_with_past_session was passed, although use_cache is False."
+                    "Please pass use_cache=True for decoder_with_past_session to be used."
+                )
+
+        if use_cache is False and use_io_binding is True:
+            raise ValueError(
+                "When using CUDAExecutionProvider, the parameters combination use_cache=False, use_io_binding=True"
+                " is not supported. Please either pass use_cache=True, use_io_binding=True (default),"
+                " or use_cache=False, use_io_binding=False."
             )
-            self.use_io_binding = False
 
-        self.encoder = self._initialize_encoder(
-            session=encoder_session, config=self.config, device=self._device, use_io_binding=self.use_io_binding
-        )
-        self.decoder = ORTDecoder(
-            session=decoder_session, config=self.config, device=self._device, use_io_binding=self.use_io_binding
-        )
+        self.use_merged = use_merged
 
-        self.use_cache = decoder_with_past_session is not None
+        self.encoder = self._initialize_encoder(encoder_session)
+        self.encoder_model_path = Path(encoder_session._model_path)
+        self.encoder_model_name = self.encoder_model_path.name
+
+        self.decoder = ORTDecoderForSeq2Seq(decoder_session, self)
+        self.decoder_model_path = Path(decoder_session._model_path)
+        self.decoder_model_name = self.decoder_model_path.name
 
         # If a decoder_with_past_path is provided, an inference session for the decoder with past key/values as inputs
         # will be enabled
         self.decoder_with_past = None
-        if self.use_cache:
-            self.decoder_with_past = ORTDecoder(
-                session=decoder_with_past_session,
-                config=self.config,
-                device=self._device,
-                use_io_binding=self.use_io_binding,
-            )
+        self.decoder_with_past_model_path = None
+        self.decoder_with_past_model_name = None
+        if self.use_cache is True and self.use_merged is False:
+            self.decoder_with_past = ORTDecoderForSeq2Seq(decoder_with_past_session, self)
+            self.decoder_with_past_model_path = Path(decoder_with_past_session._model_path)
+            self.decoder_with_past_model_name = self.decoder_with_past_model_path.name
 
-        # Registers the ORTModelForXXX classes into the transformers AutoModel classes
-        # to avoid warnings when create a pipeline https://github.com/huggingface/transformers/blob/cad61b68396a1a387287a8e2e2fef78a25b79383/src/transformers/pipelines/base.py#L863
-        AutoConfig.register(self.base_model_prefix, AutoConfig)
-        self.auto_model_class.register(AutoConfig, self.__class__)
+        if generation_config is None:
+            generation_config = GenerationConfig.from_model_config(config)
+        self.generation_config = generation_config
+
+        if is_transformers_version(">=", "4.44.99"):
+            misplaced_generation_parameters = self.config._get_non_default_generation_parameters()
+            if len(misplaced_generation_parameters) > 0:
+                logger.warning(
+                    "Moving the following attributes in the config to the generation config: "
+                    f"{misplaced_generation_parameters}. You are seeing this warning because you've set "
+                    "generation parameters in the model config, as opposed to in the generation config.",
+                )
+                for param_name, param_value in misplaced_generation_parameters.items():
+                    setattr(self.generation_config, param_name, param_value)
+                    setattr(self.config, param_name, None)
 
     @abstractmethod
-    def _initialize_encoder(
-        self,
-        session: ort.InferenceSession,
-        config: "PretrainedConfig",
-        device: torch.device,
-        use_io_binding: bool = True,
-    ) -> "ORTEncoder":
+    def _initialize_encoder(self, session: ort.InferenceSession) -> ORTEncoder:
         pass
 
     @staticmethod
@@ -352,47 +692,20 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
                 Provider option dictionary corresponding to the provider used. See available options
                 for each provider: https://onnxruntime.ai/docs/api/c/group___global.html . Defaults to `None`.
         """
-        validate_provider_availability(provider)  # raise error if the provider is not available
-
-        providers = [provider]
-        if provider == "TensorrtExecutionProvider":
-            # follow advice in https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html#python
-            providers.append("CUDAExecutionProvider")
-
-        encoder_session = ort.InferenceSession(
-            str(encoder_path),
-            providers=providers,
-            sess_options=session_options,
-            provider_options=None if provider_options is None else [provider_options],
-        )
-        decoder_session = ort.InferenceSession(
-            str(decoder_path),
-            providers=providers,
-            sess_options=session_options,
-            provider_options=None if provider_options is None else [provider_options],
-        )
+        encoder_session = ORTModel.load_model(encoder_path, provider, session_options, provider_options)
+        decoder_session = ORTModel.load_model(decoder_path, provider, session_options, provider_options)
 
         decoder_with_past_session = None
         # If a decoder_with_past_path is provided, an inference session for the decoder with past key/values as inputs
         # will be enabled
         if decoder_with_past_path is not None:
-            decoder_with_past_session = ort.InferenceSession(
-                str(decoder_with_past_path),
-                providers=providers,
-                sess_options=session_options,
-                provider_options=None if provider_options is None else [provider_options],
+            decoder_with_past_session = ORTModel.load_model(
+                decoder_with_past_path, provider, session_options, provider_options
             )
 
         return encoder_session, decoder_session, decoder_with_past_session
 
-    def _save_pretrained(
-        self,
-        save_directory: Union[str, Path],
-        # TODO: should we make the default values available here?
-        encoder_file_name: Optional[str] = None,
-        decoder_file_name: Optional[str] = None,
-        decoder_with_past_file_name: Optional[str] = None,
-    ):
+    def _save_pretrained(self, save_directory: Union[str, Path]):
         """
         Saves the model encoder, decoder and decoder with past key values as well as its configuration file to a
         directory, so that it can be re-loaded using the
@@ -401,222 +714,339 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
         Args:
             save_directory (`Union[str, Path`]):
                 The directory where to save the model files.
-            encoder_file_name(`Optional[str]`, *optional*):
-                The encoder model file name. Overwrites the default file name and allows one to save the encoder model
-                with a different name.
-            decoder_file_name(`Optional[str]`, *optional*):
-                The decoder model file name. Overwrites the default file name and allows one to save the decoder model
-                with a different name.
-            decoder_with_past_file_name(`Optional[str]`, *optional*):
-                The decoder with past key values model file name overwriting the default file name, allowing to save
-                the decoder model with a different name.
         """
-        src_file_names = [self.encoder_file_name, self.decoder_file_name]
-        dst_file_names = [encoder_file_name or ONNX_ENCODER_NAME, decoder_file_name or ONNX_DECODER_NAME]
-        if self.use_cache:
-            src_file_names.append(self.decoder_file_with_past_name)
-            dst_file_names.append(decoder_with_past_file_name or ONNX_DECODER_WITH_PAST_NAME)
+        save_directory = Path(save_directory)
+        src_paths = [Path(path) for path in self.onnx_paths]
+        dst_paths = [save_directory / path.name for path in src_paths]
 
-        for src_file_name, dst_file_name in zip(src_file_names, dst_file_names):
-            src_path = self.model_save_dir.joinpath(src_file_name)
-            dst_path = Path(save_directory).joinpath(dst_file_name)
+        # add external data paths in case of large models
+        src_paths, dst_paths = _get_external_data_paths(src_paths, dst_paths)
+
+        for src_path, dst_path in zip(src_paths, dst_paths):
             shutil.copyfile(src_path, dst_path)
+
+        self.generation_config.save_pretrained(save_directory)
 
     @classmethod
     def _from_pretrained(
         cls,
         model_id: Union[str, Path],
         config: "PretrainedConfig",
-        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         encoder_file_name: str = ONNX_ENCODER_NAME,
         decoder_file_name: str = ONNX_DECODER_NAME,
         decoder_with_past_file_name: str = ONNX_DECODER_WITH_PAST_NAME,
         subfolder: str = "",
         local_files_only: bool = False,
         use_cache: bool = True,
+        use_merged: Optional[bool] = None,
         provider: str = "CPUExecutionProvider",
         session_options: Optional[ort.SessionOptions] = None,
         provider_options: Optional[Dict[str, Any]] = None,
-        use_io_binding: bool = True,
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        **kwargs,
     ):
-        kwargs = {"use_io_binding": use_io_binding}
+        generation_config = kwargs.pop("generation_config", None)
+        model_path = Path(model_id)
 
-        # Load model from a local directory
-        if os.path.isdir(os.path.join(model_id, subfolder)):
-            decoder_with_past_path = (
-                os.path.join(model_id, subfolder, decoder_with_past_file_name) if use_cache else None
+        # We do not implement the logic for use_cache=False, use_merged=True
+        if use_cache is False:
+            if use_merged is True:
+                raise ValueError(
+                    "The parameters combination use_cache=False, use_merged=True is not supported."
+                    " To use a merged decoder, past key values must be used."
+                )
+            use_merged = False
+
+        decoder_merged_path = None
+        # We use `is not False` here to include two cases: use_merged = None (in which case we auto-detect it),
+        # and use_merged = True (explicitely specified by the user)
+        if use_merged is not False:
+            try:
+                decoder_merged_path = ORTModelForConditionalGeneration.infer_onnx_filename(
+                    model_id,
+                    [DECODER_MERGED_ONNX_FILE_PATTERN],
+                    argument_name=None,
+                    subfolder=subfolder,
+                    token=token,
+                    revision=revision,
+                )
+                use_merged = True
+                decoder_path = decoder_merged_path
+            except FileNotFoundError as e:
+                if use_merged is True:
+                    raise FileNotFoundError(
+                        "The parameter `use_merged=True` was passed to ORTModelForCausalLM.from_pretrained()"
+                        " but no ONNX file for a merged decoder could be found in"
+                        f" {str(Path(model_id, subfolder))}, with the error: {e}"
+                    )
+                use_merged = False
+
+        decoder_without_past_path = None
+        decoder_with_past_path = None
+        if use_merged is False:
+            if not validate_file_exists(model_id, decoder_file_name, subfolder=subfolder, revision=revision):
+                decoder_without_past_path = ORTModelForConditionalGeneration.infer_onnx_filename(
+                    model_id,
+                    [DECODER_ONNX_FILE_PATTERN],
+                    "decoder_file_name",
+                    subfolder=subfolder,
+                    token=token,
+                    revision=revision,
+                )
+            else:
+                decoder_without_past_path = model_path / subfolder / decoder_file_name
+
+            decoder_path = decoder_without_past_path
+
+            decoder_regular_onnx_filenames = ORTModelForConditionalGeneration._generate_regular_names_for_filename(
+                ONNX_DECODER_NAME
             )
-            model = cls.load_model(
-                encoder_path=os.path.join(model_id, subfolder, encoder_file_name),
-                decoder_path=os.path.join(model_id, subfolder, decoder_file_name),
-                decoder_with_past_path=decoder_with_past_path,
-                provider=provider,
-                session_options=session_options,
-                provider_options=provider_options,
+            if decoder_path.name not in decoder_regular_onnx_filenames:
+                logger.warning(
+                    f"The ONNX file {decoder_path.name} is not a regular name used in optimum.onnxruntime that are {decoder_regular_onnx_filenames}, the "
+                    f"{cls.__name__} might not behave as expected."
+                )
+
+            # If the decoder without / with past has been merged, we do not need to look for any additional file
+            if use_cache is True and use_merged is False:
+                if not validate_file_exists(
+                    model_id, decoder_with_past_file_name, subfolder=subfolder, revision=revision
+                ):
+                    try:
+                        decoder_with_past_path = ORTModelForConditionalGeneration.infer_onnx_filename(
+                            model_id,
+                            [DECODER_WITH_PAST_ONNX_FILE_PATTERN],
+                            "decoder_with_past_file_name",
+                            subfolder=subfolder,
+                            token=token,
+                            revision=revision,
+                        )
+                    except FileNotFoundError as e:
+                        raise FileNotFoundError(
+                            "The parameter `use_cache=True` was passed to ORTModelForCausalLM.from_pretrained()"
+                            " but no ONNX file using past key values could be found in"
+                            f" {str(Path(model_id, subfolder))}, with the error: {e}"
+                        )
+                else:
+                    decoder_with_past_path = model_path / subfolder / decoder_with_past_file_name
+
+                decoder_path = decoder_without_past_path
+
+                decoder_with_past_regular_onnx_filenames = (
+                    ORTModelForConditionalGeneration._generate_regular_names_for_filename(ONNX_DECODER_WITH_PAST_NAME)
+                )
+
+                if decoder_with_past_path.name not in decoder_with_past_regular_onnx_filenames:
+                    logger.warning(
+                        f"The ONNX file {decoder_with_past_path.name} is not a regular name used in optimum.onnxruntime that are {decoder_with_past_regular_onnx_filenames}, "
+                        f"the {cls.__name__} might not behave as expected."
+                    )
+
+        if not validate_file_exists(model_id, encoder_file_name, subfolder=subfolder, revision=revision):
+            encoder_path = ORTModelForConditionalGeneration.infer_onnx_filename(
+                model_id,
+                [ENCODER_ONNX_FILE_PATTERN],
+                "encoder_file_name",
+                subfolder=subfolder,
+                token=token,
+                revision=revision,
             )
-            kwargs["model_save_dir"] = Path(model_id).joinpath(subfolder)
-            kwargs["last_encoder_model_name"] = encoder_file_name
-            kwargs["last_decoder_model_name"] = decoder_file_name
-            kwargs["last_decoder_with_past_model_name"] = decoder_with_past_file_name
-        # Load model from hub
         else:
-            default_file_names = [ONNX_ENCODER_NAME, ONNX_DECODER_NAME]
-            model_file_names = [encoder_file_name, decoder_file_name]
-            if use_cache:
-                default_file_names.append(ONNX_DECODER_WITH_PAST_NAME)
-                model_file_names.append(decoder_with_past_file_name)
-            # Download the encoder, decoder and decoder_with_past forming the model
-            for file_name, default_file_name in zip(model_file_names, default_file_names):
+            encoder_path = model_path / subfolder / encoder_file_name
+
+        encoder_regular_onnx_filenames = ORTModelForConditionalGeneration._generate_regular_names_for_filename(
+            ONNX_ENCODER_NAME
+        )
+        if encoder_path.name not in encoder_regular_onnx_filenames:
+            logger.warning(
+                f"The ONNX file {encoder_path.name} is not a regular name used in optimum.onnxruntime, the "
+                "ORTModelForConditionalGeneration might not behave as expected."
+            )
+
+        preprocessors = None
+        if model_path.is_dir():
+            new_model_save_dir = model_path
+            preprocessors = maybe_load_preprocessors(model_id)
+        else:
+            attribute_name_to_filename = {
+                "last_encoder_model_name": encoder_path.name,
+                "last_decoder_model_name": decoder_path.name if use_merged is False else None,
+                "last_decoder_with_past_model_name": (
+                    decoder_with_past_path.name if (use_merged is False and use_cache is True) else None
+                ),
+                "last_decoder_merged_name": decoder_merged_path.name if use_merged is True else None,
+            }
+            paths = {}
+            for attr_name, filename in attribute_name_to_filename.items():
+                if filename is None:
+                    continue
                 model_cache_path = hf_hub_download(
                     repo_id=model_id,
                     subfolder=subfolder,
-                    filename=file_name,
-                    use_auth_token=use_auth_token,
+                    filename=filename,
+                    token=token,
                     revision=revision,
                     cache_dir=cache_dir,
                     force_download=force_download,
                     local_files_only=local_files_only,
                 )
-                kwargs[f"last_{default_file_name.split('.')[0]}_name"] = Path(model_cache_path).name
-            kwargs["model_save_dir"] = Path(model_cache_path).parent
+                # try download external data
+                try:
+                    hf_hub_download(
+                        repo_id=model_id,
+                        subfolder=subfolder,
+                        filename=filename + "_data",
+                        token=token,
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        local_files_only=local_files_only,
+                    )
+                except EntryNotFoundError:
+                    # model doesn't use external data
+                    pass
 
-            last_decoder_with_past_name = kwargs.get("last_decoder_with_past_model_name", None)
-            if last_decoder_with_past_name is not None:
-                last_decoder_with_past_name = kwargs["model_save_dir"].joinpath(last_decoder_with_past_name)
-            model = cls.load_model(
-                encoder_path=kwargs["model_save_dir"].joinpath(kwargs["last_encoder_model_name"]),
-                decoder_path=kwargs["model_save_dir"].joinpath(kwargs["last_decoder_model_name"]),
-                decoder_with_past_path=last_decoder_with_past_name,
-                provider=provider,
-                session_options=session_options,
-                provider_options=provider_options,
-            )
+                paths[attr_name] = Path(model_cache_path).name
+            new_model_save_dir = Path(model_cache_path).parent
+            preprocessors = maybe_load_preprocessors(model_id, subfolder=subfolder)
 
-        return cls(*model[:2], config, decoder_with_past_session=model[2], **kwargs)
+            if use_merged is True:
+                decoder_path = new_model_save_dir / paths["last_decoder_merged_name"]
+                decoder_merged_path = new_model_save_dir / paths["last_decoder_merged_name"]
+            else:
+                decoder_path = new_model_save_dir / paths["last_decoder_model_name"]
+                decoder_without_past_path = new_model_save_dir / paths["last_decoder_model_name"]
+
+                if use_cache is True:
+                    decoder_with_past_path = new_model_save_dir / paths["last_decoder_with_past_model_name"]
+
+            encoder_path = new_model_save_dir / paths["last_encoder_model_name"]
+
+        ort_inference_sessions = cls.load_model(
+            encoder_path=encoder_path,
+            decoder_path=decoder_path,
+            decoder_with_past_path=None if use_merged is True or use_cache is False else decoder_with_past_path,
+            provider=provider,
+            session_options=session_options,
+            provider_options=provider_options,
+        )
+
+        if model_save_dir is None:
+            model_save_dir = new_model_save_dir
+
+        if generation_config is None:
+            try:
+                generation_config = GenerationConfig.from_pretrained(
+                    model_id,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                )
+            except OSError:
+                logger.info(
+                    "Generation config file not found, using a generation config created from the model config."
+                )
+
+        onnx_paths = [encoder_path]
+        if use_merged is False:
+            onnx_paths.append(decoder_without_past_path)
+            if use_cache is True:
+                onnx_paths.append(decoder_with_past_path)
+        else:
+            onnx_paths.append(decoder_merged_path)
+
+        return cls(
+            *ort_inference_sessions[:2],
+            config,
+            onnx_paths=onnx_paths,
+            use_cache=use_cache,
+            decoder_with_past_session=ort_inference_sessions[2],
+            use_io_binding=use_io_binding,
+            model_save_dir=model_save_dir,
+            preprocessors=preprocessors,
+            generation_config=generation_config,
+        )
 
     @classmethod
     def _from_transformers(
         cls,
         model_id: str,
         config: "PretrainedConfig",
-        save_dir: Union[str, Path] = default_cache_path,
-        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: str = "main",
         force_download: bool = True,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         subfolder: str = "",
         local_files_only: bool = False,
+        trust_remote_code: bool = False,
         use_cache: bool = True,
+        use_merged: bool = False,
         provider: str = "CPUExecutionProvider",
         session_options: Optional[ort.SessionOptions] = None,
         provider_options: Optional[Dict[str, Any]] = None,
-        use_io_binding: bool = True,
-    ):
-        # Create local save dir in cache dir
-        save_dir = Path(save_dir).joinpath(model_id, subfolder)
-        save_dir.mkdir(parents=True, exist_ok=True)
+        use_io_binding: Optional[bool] = None,
+        task: Optional[str] = None,
+    ) -> "ORTModelForConditionalGeneration":
+        if use_cache is False and use_merged is True:
+            raise ValueError(
+                "The incompatible arguments use_cache=False, use_merged=True were passed to"
+                " ORTModelForConditionalGeneration.from_pretrained(). Please pass either use_cache=False,"
+                " use_merged=False to disable past key value caching, or use_cache=True, use_merged=False"
+                " to disable the merging of the decoder not using / using past key and value."
+            )
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if task is None:
+            task = cls._auto_model_to_task(cls.auto_model_class)
 
-        framework = FeaturesManager.determine_framework(os.path.join(model_id, subfolder))
-        model_class = FeaturesManager.get_model_class_for_feature(cls.export_feature, framework)
-        model = model_class.from_pretrained(
-            model_id,
+            if use_cache is True:
+                task = task + "-with-past"
+
+        save_dir = TemporaryDirectory()
+        save_dir_path = Path(save_dir.name)
+
+        main_export(
+            model_name_or_path=model_id,
+            output=save_dir_path,
+            task=task,
+            do_validation=False,
+            no_post_process=not use_merged,
             subfolder=subfolder,
-            config=config,
-            cache_dir=cache_dir,
             revision=revision,
-            use_auth_token=use_auth_token,
+            cache_dir=cache_dir,
+            token=token,
             local_files_only=local_files_only,
+            force_download=force_download,
+            trust_remote_code=trust_remote_code,
         )
-
-        _, model_onnx_config = FeaturesManager.check_supported_model_or_raise(model, feature=cls.export_feature)
-        onnx_config = model_onnx_config(model.config)
-        onnx_opset = onnx_config.default_onnx_opset
-
-        # Extract the encoder and decoder for ONNX export
-        encoder = model.get_encoder()
-        decoder = model.get_decoder()
-
-        # Concatenate the decoder with the language model head for ONNX export
-        decoder_with_lm_head = _DecoderWithLMhead(model)
-
-        # Get the encoder and decoder ONNX configs
-        onnx_config_encoder = cls.get_encoder_onnx_config(encoder.config)
-        onnx_config_decoder = cls.get_decoder_onnx_config(decoder.config, cls.export_feature, use_past=False)
-        if use_cache:
-            onnx_config_decoder_with_past = cls.get_decoder_onnx_config(
-                decoder.config, cls.export_feature, use_past=True
-            )
-
-        if config.model_type == "whisper":
-            from ..exporters.onnx.convert import export as export_optimum
-
-            # Export the encoder
-            export_optimum(
-                encoder,
-                onnx_config_encoder,
-                onnx_opset,
-                save_dir.joinpath(ONNX_ENCODER_NAME),
-            )
-
-            # Export the decoder without the past key values
-            export_optimum(
-                model,
-                onnx_config_decoder,
-                onnx_opset,
-                save_dir.joinpath(ONNX_DECODER_NAME),
-            )
-
-            # Export the decoder with the past key values
-            if use_cache:
-                export_optimum(
-                    model,
-                    onnx_config_decoder_with_past,
-                    onnx_opset,
-                    save_dir.joinpath(ONNX_DECODER_WITH_PAST_NAME),
-                )
-        else:
-            # Export the encoder
-            export(
-                preprocessor=tokenizer,
-                model=encoder,
-                config=onnx_config_encoder,
-                opset=onnx_opset,
-                output=save_dir.joinpath(ONNX_ENCODER_NAME),
-            )
-
-            # Export the decoder without the past key values
-            export(
-                preprocessor=tokenizer,
-                model=decoder_with_lm_head,
-                config=onnx_config_decoder,
-                opset=onnx_opset,
-                output=save_dir.joinpath(ONNX_DECODER_NAME),
-            )
-
-            # Export the decoder with the past key values
-            if use_cache:
-                export(
-                    preprocessor=tokenizer,
-                    model=decoder_with_lm_head,
-                    config=onnx_config_decoder_with_past,
-                    opset=onnx_opset,
-                    output=save_dir.joinpath(ONNX_DECODER_WITH_PAST_NAME),
-                )
+        maybe_save_preprocessors(model_id, save_dir_path, src_subfolder=subfolder)
 
         return cls._from_pretrained(
-            save_dir,
-            config=config,
+            save_dir_path,
+            config,
             use_cache=use_cache,
+            use_merged=use_merged,
             provider=provider,
             session_options=session_options,
             provider_options=provider_options,
             use_io_binding=use_io_binding,
+            model_save_dir=save_dir,
         )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """
+        `torch.dtype`: The dtype of the model.
+        """
+
+        return self.encoder.dtype or self.decoder.dtype
 
     def to(self, device: Union[torch.device, str, int]):
         """
@@ -632,559 +1062,36 @@ class ORTModelForConditionalGeneration(ORTModel, ABC):
         """
         device, provider_options = parse_device(device)
 
+        if device.type == "cuda" and self.providers[0] == "TensorrtExecutionProvider":
+            return self
+
         provider = get_provider_for_device(device)
         validate_provider_availability(provider)  # raise error if the provider is not available
 
-        self.device = device
-        self.encoder._device = device
         self.encoder.session.set_providers([provider], provider_options=[provider_options])
-        self.decoder._device = device
         self.decoder.session.set_providers([provider], provider_options=[provider_options])
         if self.decoder_with_past is not None:
-            self.decoder_with_past._device = device
             self.decoder_with_past.session.set_providers([provider], provider_options=[provider_options])
         self.providers = self.encoder.session.get_providers()
+        self._device = device
 
         return self
 
 
-class ORTEncoder:
-    """
-    Encoder model for ONNX Runtime inference.
-
-    Args:
-        session (`ort.InferenceSession`):
-            The ONNX Runtime inference session associated to the encoder.
-    """
-
-    def __init__(
-        self,
-        session: ort.InferenceSession,
-        config: "PretrainedConfig",
-        device: torch.device,
-        use_io_binding: bool = True,
-        main_input_name: str = "input_ids",
-    ):
-        self.session = session
-        self.config = config
-        self._device = device
-        self.use_io_binding = use_io_binding
-        self.main_input_name = main_input_name
-        self.normalized_config = ORTConfigManager.get_normalized_config_class(self.config.model_type)(self.config)
-        self.input_names = {input_key.name: idx for idx, input_key in enumerate(self.session.get_inputs())}
-        self.output_names = {output_key.name: idx for idx, output_key in enumerate(self.session.get_outputs())}
-        self.name_to_np_type = TypeHelper.get_io_numpy_type_map(self.session) if self.use_io_binding else None
-
-    def prepare_output_buffer(self, batch_size, sequence_length):
-        """Prepare the buffer of output(`last_hidden_state`) with a 1D tensor on shape: (batch_size, sequence_length, hidden_size)."""
-        ort_type = TypeHelper.get_output_type(self.session, "last_hidden_state")
-        torch_type = TypeHelper.ort_type_to_torch_type(ort_type)
-
-        hidden_size = self.normalized_config.hidden_size
-        output_shape = (batch_size, sequence_length, hidden_size)
-        output_buffer = torch.empty(np.prod(output_shape), dtype=torch_type, device=self._device).contiguous()
-
-        return output_shape, output_buffer
-
-    def prepare_io_binding(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ):
-        io_binding = self.session.io_binding()
-
-        # bind input ids
-        input_ids = input_ids.contiguous()
-        io_binding.bind_input(
-            "input_ids",
-            input_ids.device.type,
-            self._device.index,
-            self.name_to_np_type["input_ids"],
-            tuple(input_ids.shape),
-            input_ids.data_ptr(),
-        )
-        if "attention_mask" in self.input_names:
-            # bind attention mask
-            attention_mask = attention_mask.contiguous()
-            io_binding.bind_input(
-                "attention_mask",
-                attention_mask.device.type,
-                self._device.index,
-                self.name_to_np_type["attention_mask"],
-                tuple(attention_mask.shape),
-                attention_mask.data_ptr(),
-            )
-
-        # bind last_hidden_state
-        output_shape, output_buffer = self.prepare_output_buffer(
-            batch_size=input_ids.size(0),
-            sequence_length=input_ids.size(1),
-        )
-        io_binding.bind_output(
-            "last_hidden_state",
-            output_buffer.device.type,
-            self._device.index,
-            self.name_to_np_type["last_hidden_state"],
-            output_shape,
-            output_buffer.data_ptr(),
-        )
-        output_shapes = {"last_hidden_state": output_shape}
-        output_buffers = {"last_hidden_state": output_buffer}
-
-        return io_binding, output_shapes, output_buffers
-
-    @add_start_docstrings_to_model_forward(SEQ2SEQ_ENCODER_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.LongTensor,
-        **kwargs,
-    ) -> BaseModelOutput:
-
-        if self._device.type == "cuda" and self.use_io_binding:
-            io_binding, output_shapes, output_buffers = self.prepare_io_binding(input_ids, attention_mask)
-
-            # run inference with binding & synchronize in case of multiple CUDA streams
-            io_binding.synchronize_inputs()
-            self.session.run_with_iobinding(io_binding)
-            io_binding.synchronize_outputs()
-
-            # converts output to namedtuple for pipelines post-processing
-            return BaseModelOutput(
-                last_hidden_state=output_buffers["last_hidden_state"].view(output_shapes["last_hidden_state"])
-            )
-        else:
-            onnx_inputs = {"input_ids": input_ids.cpu().detach().numpy()}
-
-            # Add the attention_mask inputs when needed
-            if "attention_mask" in self.input_names:
-                onnx_inputs["attention_mask"] = attention_mask.cpu().detach().numpy()
-
-            # Run inference
-            outputs = self.session.run(None, onnx_inputs)
-            last_hidden_state = torch.from_numpy(outputs[self.output_names["last_hidden_state"]]).to(self._device)
-
-            return BaseModelOutput(last_hidden_state=last_hidden_state)
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-
-class ORTEncoderForWhisper(ORTEncoder):
-    """
-    Encoder model for ONNX Runtime inference for Whisper model.
-
-    Args:
-        session (`ort.InferenceSession`):
-            The ONNX Runtime inference session associated to the encoder.
-    """
-
-    def prepare_io_binding(
-        self,
-        input_features: torch.FloatTensor = None,
-    ):
-        io_binding = self.session.io_binding()
-
-        # bind input features
-        input_features = input_features.contiguous()
-        io_binding.bind_input(
-            "input_features",
-            input_features.device.type,
-            self._device.index,
-            self.name_to_np_type["input_features"],
-            tuple(input_features.shape),
-            input_features.data_ptr(),
-        )
-
-        # bind logits
-        output_shape, output_buffer = self.prepare_output_buffer(
-            batch_size=input_features.size(0),
-            sequence_length=input_features.size(2) // 2,
-        )
-        io_binding.bind_output(
-            "last_hidden_state",
-            output_buffer.device.type,
-            self._device.index,
-            self.name_to_np_type["last_hidden_state"],
-            output_shape,
-            output_buffer.data_ptr(),
-        )
-        output_shapes = {"last_hidden_state": output_shape}
-        output_buffers = {"last_hidden_state": output_buffer}
-
-        return io_binding, output_shapes, output_buffers
-
-    @add_start_docstrings_to_model_forward(WHISPER_ENCODER_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_features: torch.FloatTensor,
-        **kwargs,
-    ) -> BaseModelOutput:
-        if self._device.type == "cuda" and self.use_io_binding:
-            io_binding, output_shapes, output_buffers = self.prepare_io_binding(input_features)
-
-            # run inference with binding & synchronize in case of multiple CUDA streams
-            io_binding.synchronize_inputs()
-            self.session.run_with_iobinding(io_binding)
-            io_binding.synchronize_outputs()
-
-            # converts output to namedtuple for pipelines post-processing
-            return BaseModelOutput(
-                last_hidden_state=output_buffers["last_hidden_state"].view(output_shapes["last_hidden_state"])
-            )
-        else:
-            onnx_inputs = {"input_features": input_features.cpu().detach().numpy()}
-
-            # Run inference
-            outputs = self.session.run(None, onnx_inputs)
-            last_hidden_state = torch.from_numpy(outputs[self.output_names["last_hidden_state"]]).to(self._device)
-
-            return BaseModelOutput(last_hidden_state=last_hidden_state)
-
-
-class ORTDecoder:
-    """
-    Decoder model with a language modeling head on top for ONNX Runtime inference.
-
-    Args:
-        session (`ort.InferenceSession`):
-            The ONNX Runtime inference session associated to the decoder.
-    """
-
-    def __init__(
-        self,
-        session: ort.InferenceSession,
-        config: "PretrainedConfig",
-        device: torch.device,
-        use_io_binding: bool = True,
-    ):
-        self.session = session
-        self.config = config
-        self.normalized_config = ORTConfigManager.get_normalized_config_class(self.config.model_type)(self.config)
-        self._device = device
-        self.use_io_binding = use_io_binding
-        self.session_inputs = {output_key.name: idx for idx, output_key in enumerate(self.session.get_inputs())}
-        self.session_outputs = {output_key.name: idx for idx, output_key in enumerate(self.session.get_outputs())}
-        self.session_input_names = list(self.session_inputs.keys())
-        self.session_output_names = list(self.session_outputs.keys())
-        self.key_value_input_names = [
-            key for key in self.session_input_names if ("key_values" in key or ".key" in key or ".value" in key)
-        ]
-        self.key_value_output_names = [
-            key for key in self.session_output_names if ("key_values" in key or ".key" in key or ".value" in key)
-        ]
-        self.name_to_np_type = TypeHelper.get_io_numpy_type_map(self.session) if self.use_io_binding else None
-
-    def prepare_output_buffer(
-        self,
-        output_name,
-        batch_size=None,
-        sequence_length=None,
-        encoder_sequence_length=None,
-        past_sequence_length=None,
-        is_self_attn=False,
-    ):
-        """
-        Prepare the buffer of outputs(`logits`/`key_values`/`loss`) with 1D tensors.
-        """
-        ort_type = TypeHelper.get_output_type(self.session, output_name)
-        torch_type = TypeHelper.ort_type_to_torch_type(ort_type)
-        if output_name == "loss":
-            output_shape = (1,)
-            output_buffer = torch.empty(1, dtype=torch_type, device=self._device).contiguous()
-        elif output_name == "logits":
-            output_shape = (batch_size, sequence_length, self.normalized_config.vocab_size)
-            output_buffer = torch.empty(np.prod(output_shape), dtype=torch_type, device=self._device).contiguous()
-        elif "key_values" in output_name or ".key" in output_name or ".value" in output_name:
-            num_attention_heads = self.normalized_config.num_attention_heads
-            hidden_size = self.normalized_config.hidden_size
-            embed_size_per_head = hidden_size // num_attention_heads
-            if is_self_attn:
-                if past_sequence_length is not None:
-                    sequence_length += past_sequence_length
-                output_shape = (batch_size, num_attention_heads, sequence_length, embed_size_per_head)
-            else:
-                output_shape = (batch_size, num_attention_heads, encoder_sequence_length, embed_size_per_head)
-
-            output_buffer = torch.empty(np.prod(output_shape), dtype=torch_type, device=self._device).contiguous()
-
-        return output_shape, output_buffer
-
-    def prepare_io_binding(
-        self,
-        input_ids: torch.LongTensor,
-        encoder_hidden_states: torch.FloatTensor,
-        encoder_attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
-    ):
-        io_binding = self.session.io_binding()
-
-        # bind input ids
-        input_ids = input_ids.contiguous()
-        io_binding.bind_input(
-            "input_ids",
-            input_ids.device.type,
-            self._device.index,
-            self.name_to_np_type["input_ids"],
-            list(input_ids.size()),
-            input_ids.data_ptr(),
-        )
-
-        # bind encoder attention mask
-        if "encoder_attention_mask" in self.session_input_names:
-            encoder_attention_mask = encoder_attention_mask.contiguous()
-            io_binding.bind_input(
-                "encoder_attention_mask",
-                encoder_attention_mask.device.type,
-                self._device.index,
-                self.name_to_np_type["encoder_attention_mask"],
-                list(encoder_attention_mask.size()),
-                encoder_attention_mask.data_ptr(),
-            )
-
-        # bind encoder hidden states
-        if "encoder_hidden_states" in self.session_input_names:
-            encoder_hidden_states = encoder_hidden_states.contiguous()
-            io_binding.bind_input(
-                "encoder_hidden_states",
-                encoder_hidden_states.device.type,
-                self._device.index,
-                self.name_to_np_type["encoder_hidden_states"],
-                list(encoder_hidden_states.size()),
-                encoder_hidden_states.data_ptr(),
-            )
-
-        # bind past key values
-        if past_key_values is not None:
-            for input_name, past_key_value in zip(self.key_value_input_names, past_key_values):
-                past_key_value = past_key_value.contiguous()
-                io_binding.bind_input(
-                    input_name,
-                    past_key_value.device.type,
-                    self._device.index,
-                    self.name_to_np_type[input_name],
-                    list(past_key_value.size()),
-                    past_key_value.data_ptr(),
-                )
-
-        # bind labels
-        if "labels" in self.session_input_names:
-            labels = labels.contiguous()
-            io_binding.bind_input(
-                "labels",
-                labels.device.type,
-                self._device.index,
-                self.name_to_np_type["labels"],
-                list(labels.size()),
-                labels.data_ptr(),
-            )
-
-        # bind outputs
-        # bind logits
-        logits_shape, logits_buffer = self.prepare_output_buffer(
-            output_name="logits",
-            batch_size=input_ids.size(0),
-            sequence_length=input_ids.size(1),
-        )
-        io_binding.bind_output(
-            "logits",
-            logits_buffer.device.type,
-            self._device.index,
-            self.name_to_np_type["logits"],
-            logits_shape,
-            logits_buffer.data_ptr(),
-        )
-        output_shapes = {"logits": logits_shape}
-        output_buffers = {"logits": logits_buffer}
-        # bind loss
-        if "loss" in self.session_output_names:
-            loss_shape, loss_buffer = self.prepare_output_buffer(output_name="loss")
-            io_binding.bind_output(
-                "loss",
-                loss_buffer.device.type,
-                self._device.index,
-                self.name_to_np_type["loss"],
-                loss_shape,
-                loss_buffer.data_ptr(),
-            )
-            output_shapes["loss"] = loss_shape
-            output_buffers["loss"] = loss_buffer
-
-        # bind past key values
-        num_pkv = 4  # number of self-attention and cross-attention per decoder layer
-        for pkv_names_per_layer in [
-            self.key_value_output_names[i : i + num_pkv] for i in range(0, len(self.key_value_output_names), num_pkv)
-        ]:
-            # bind a self attention and a cross-attention each time(2)
-            for i in range(2):
-                # bind self-attention past key values(2)
-                self_name = pkv_names_per_layer[i]
-                self_pkv_shape, self_pkv_buffer = self.prepare_output_buffer(
-                    output_name=self_name,
-                    batch_size=input_ids.size(0),
-                    sequence_length=input_ids.size(1),
-                    past_sequence_length=past_key_values[0].size(2)
-                    if past_key_values
-                    else None,  # sequence length of self-attention key for layer.0
-                    is_self_attn=True,
-                )
-                io_binding.bind_output(
-                    self_name,
-                    self_pkv_buffer.device.type,
-                    self._device.index,
-                    self.name_to_np_type[self_name],
-                    self_pkv_shape,
-                    self_pkv_buffer.data_ptr(),
-                )
-                # set -1 for sequence_length as it could be larger than the real sequence_length for creating buffer
-                self_pkv_shape = self_pkv_shape[:2] + (-1,) + self_pkv_shape[3:]
-                output_shapes[self_name] = self_pkv_shape
-                output_buffers[self_name] = self_pkv_buffer
-
-                # bind cross-attention past key values(2)
-                cross_name = pkv_names_per_layer[i + 2]
-                cross_pkv_shape, cross_pkv_buffer = self.prepare_output_buffer(
-                    output_name=cross_name,
-                    batch_size=input_ids.size(0),
-                    encoder_sequence_length=encoder_hidden_states.size(1),
-                )
-                io_binding.bind_output(
-                    cross_name,
-                    cross_pkv_buffer.device.type,
-                    self._device.index,
-                    self.name_to_np_type[cross_name],
-                    cross_pkv_shape,
-                    cross_pkv_buffer.data_ptr(),
-                )
-                # set -1 for sequence_length as it could be larger than the real sequence_length for creating buffer
-                cross_pkv_shape = cross_pkv_shape[:2] + (-1,) + cross_pkv_shape[3:]
-                output_shapes[cross_name] = cross_pkv_shape
-                output_buffers[cross_name] = cross_pkv_buffer
-
-        return io_binding, output_shapes, output_buffers
-
-    @add_start_docstrings_to_model_forward(DECODER_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        encoder_hidden_states: torch.FloatTensor,
-        encoder_attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
-    ) -> Seq2SeqLMOutput:
-        # Flatten the past_key_values
-        if past_key_values is not None:
-            past_key_values = [past_key_value for pkv_per_layer in past_key_values for past_key_value in pkv_per_layer]
-
-        if self._device.type == "cuda" and self.use_io_binding:
-            io_binding, output_shapes, output_buffers = self.prepare_io_binding(
-                input_ids, encoder_hidden_states, encoder_attention_mask, past_key_values, labels
-            )
-
-            # run inference with binding & synchronize in case of multiple CUDA streams
-            io_binding.synchronize_inputs()
-            self.session.run_with_iobinding(io_binding)
-            io_binding.synchronize_outputs()
-
-            # Tuple of length equal to : number of layer * number of past_key_value per decoder layer (2 corresponds to the
-            # self-attention layer and 2 to the cross-attention layer)
-            past_key_values = tuple()
-            for name in self.key_value_output_names:
-                past_key_values += (output_buffers[name].view(output_shapes[name]),)
-
-            # Tuple of tuple of length `n_layers`, with each tuple of length equal to the number of self-attention and
-            # cross-attention per decoder layer
-            num_pkv = 4
-            past_key_values = tuple(past_key_values[i : i + num_pkv] for i in range(0, len(past_key_values), num_pkv))
-
-            logits = output_buffers["logits"].view(output_shapes["logits"])
-
-            loss = None
-            if "loss" in self.session_output_names:
-                loss = output_buffers["loss"].view(output_shapes["loss"])
-        else:
-            onnx_inputs = {
-                "input_ids": input_ids.cpu().detach().numpy(),
-            }
-
-            # Add the encoder_attention_mask inputs when needed
-            if "encoder_attention_mask" in self.session_input_names:
-                onnx_inputs["encoder_attention_mask"] = encoder_attention_mask.cpu().detach().numpy()
-
-            # Add the encoder_hidden_states inputs when needed
-            if "encoder_hidden_states" in self.session_input_names:
-                onnx_inputs["encoder_hidden_states"] = encoder_hidden_states.cpu().detach().numpy()
-
-            if past_key_values is not None:
-                # Add the past_key_values to the decoder inputs
-                for input_name, past_key_value in zip(self.key_value_input_names, past_key_values):
-                    onnx_inputs[input_name] = past_key_value.cpu().detach().numpy()
-
-            if "labels" in self.session_input_names:
-                # TODO: Any preprocessing like  `self._shift_right(labels)`?
-                onnx_inputs["labels"] = labels.cpu().detach().numpy()
-
-            # Run inference
-            outputs = self.session.run(None, onnx_inputs)
-            # Tuple of length equal to : number of layer * number of past_key_value per decoder layer (2 corresponds to the
-            # self-attention layer and 2 to the cross-attention layer)
-            past_key_values = tuple(
-                torch.from_numpy(outputs[self.session_outputs[key]]).to(self._device)
-                for key in self.key_value_output_names
-            )
-
-            # Tuple of tuple of length `n_layers`, with each tuple of length equal to the number of self-attention and
-            # cross-attention per decoder layer
-            num_pkv = 4
-            past_key_values = tuple(past_key_values[i : i + num_pkv] for i in range(0, len(past_key_values), num_pkv))
-            logits = torch.from_numpy(outputs[self.session_outputs["logits"]]).to(self._device)
-
-            loss = None
-            if "loss" in self.session_output_names:
-                loss = torch.from_numpy(outputs[self.session_outputs["loss"]]).to(self._device)
-
-        # converts output to namedtuple for pipelines post-processing
-        return Seq2SeqLMOutput(loss=loss, logits=logits, past_key_values=past_key_values)
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-
+@add_end_docstrings(ONNX_MODEL_END_DOCSTRING)
 class ORTModelForSeq2SeqLM(ORTModelForConditionalGeneration, GenerationMixin):
     """
-    Sequence-to-sequence model with a language modeling head for ONNX Runtime inference.
+    Sequence-to-sequence model with a language modeling head for ONNX Runtime inference. This class officially supports bart, blenderbot, blenderbot_small, longt5, m2m_100, marian, mbart, mt5, pegasus, t5.
     """
 
-    export_feature = "seq2seq-lm"
     auto_model_class = AutoModelForSeq2SeqLM
     main_input_name = "input_ids"
 
-    def _initialize_encoder(
-        self,
-        session: ort.InferenceSession,
-        config: "PretrainedConfig",
-        device: torch.device,
-        use_io_binding: bool = True,
-    ) -> ORTEncoder:
-        return ORTEncoder(
-            session=session,
-            config=config,
-            device=device,
-            use_io_binding=use_io_binding,
-            main_input_name=self.main_input_name,
-        )
-
-    def get_encoder_onnx_config(encoder_config: "PretrainedConfig") -> EncoderOnnxConfig:
-        return EncoderOnnxConfig(encoder_config, task="default")
-
-    def get_decoder_onnx_config(
-        decoder_config: "PretrainedConfig", export_feature: str, use_past: bool = False
-    ) -> DecoderOnnxConfig:
-        return DecoderOnnxConfig(decoder_config, export_feature, use_past=use_past)
+    def _initialize_encoder(self, session: ort.InferenceSession) -> ORTEncoder:
+        return ORTEncoder(session, self)
 
     @add_start_docstrings_to_model_forward(
-        SEQ2SEQ_ONNX_MODEL_DOCSTRING.format("batch_size, sequence_length")
+        SEQ2SEQ_ONNX_MODEL_DOCSTRING
         + TRANSLATION_EXAMPLE.format(
             processor_class=_TOKENIZER_FOR_DOC,
             model_class="ORTModelForSeq2SeqLM",
@@ -1198,30 +1105,23 @@ class ORTModelForSeq2SeqLM(ORTModelForConditionalGeneration, GenerationMixin):
         decoder_input_ids: Optional[torch.LongTensor] = None,
         encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Seq2SeqLMOutput:
-
         # Encode if needed : first prediction pass
         if encoder_outputs is None:
             encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
 
-        # Decode
-        if past_key_values is None or self.decoder_with_past is None:
-            decoder_outputs = self.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_outputs.last_hidden_state,
-                encoder_attention_mask=attention_mask,
-                labels=labels,
-            )
-        else:
-            decoder_outputs = self.decoder_with_past(
-                input_ids=decoder_input_ids[:, -1:],  # Cut decoder_input_ids if past is used
-                past_key_values=past_key_values,
-                encoder_hidden_states=encoder_outputs.last_hidden_state,
-                encoder_attention_mask=attention_mask,
-                labels=labels,
-            )
+        model = (
+            self.decoder
+            if past_key_values is None or not self.use_cache or self.use_merged
+            else self.decoder_with_past
+        )
+        decoder_outputs = model(
+            input_ids=decoder_input_ids,
+            past_key_values=past_key_values,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=attention_mask,
+        )
 
         return Seq2SeqLMOutput(
             loss=decoder_outputs.get("loss", None),
@@ -1232,19 +1132,29 @@ class ORTModelForSeq2SeqLM(ORTModelForConditionalGeneration, GenerationMixin):
     def prepare_inputs_for_generation(
         self,
         input_ids,
-        past=None,
+        past_key_values=None,
         attention_mask=None,
+        token_type_ids=None,
         head_mask=None,
         decoder_head_mask=None,
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
-        **kwargs
+        **kwargs,
     ) -> Dict:
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
 
         return {
             "decoder_input_ids": input_ids,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "encoder_outputs": encoder_outputs,
             "attention_mask": attention_mask,
             "head_mask": head_mask,
@@ -1268,50 +1178,51 @@ class ORTModelForSeq2SeqLM(ORTModelForConditionalGeneration, GenerationMixin):
         return reordered_past
 
 
+@add_end_docstrings(ONNX_MODEL_END_DOCSTRING)
 class ORTModelForSpeechSeq2Seq(ORTModelForConditionalGeneration, GenerationMixin):
     """
-    Speech Sequence-to-sequence model with a language modeling head for ONNX Runtime inference.
+    Speech Sequence-to-sequence model with a language modeling head for ONNX Runtime inference. This class officially supports whisper, speech_to_text.
     """
 
-    export_feature = "speech2seq-lm"
     auto_model_class = AutoModelForSpeechSeq2Seq
     main_input_name = "input_features"
 
-    _MODEL_TYPE_TO_ORTENCODER = {
-        "whisper": ORTEncoderForWhisper,
-    }
-
-    def _initialize_encoder(
+    def __init__(
         self,
-        session: ort.InferenceSession,
+        encoder_session: ort.InferenceSession,
+        decoder_session: ort.InferenceSession,
         config: "PretrainedConfig",
-        device: torch.device,
-        use_io_binding: bool = True,
-    ) -> ORTEncoder:
-        if config.model_type not in self._MODEL_TYPE_TO_ORTENCODER:
-            raise KeyError(
-                f"{config.model_type} is not supported yet. "
-                f"Only {list(self._MODEL_TYPE_TO_ORTENCODER.keys())} are supported. "
-                f"If you want to support {config.model_type} please propose a PR or open up an issue."
-            )
-        return self._MODEL_TYPE_TO_ORTENCODER[config.model_type](
-            session=session,
+        onnx_paths: List[str],
+        decoder_with_past_session: Optional[ort.InferenceSession] = None,
+        use_cache: bool = True,
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        preprocessors: Optional[List] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            encoder_session=encoder_session,
+            decoder_session=decoder_session,
             config=config,
-            device=device,
+            onnx_paths=onnx_paths,
+            decoder_with_past_session=decoder_with_past_session,
+            use_cache=use_cache,
             use_io_binding=use_io_binding,
-            main_input_name=self.main_input_name,
+            model_save_dir=model_save_dir,
+            preprocessors=preprocessors,
+            generation_config=generation_config,
+            **kwargs,
         )
+        # Following a breaking change in transformers that relies directly on the mapping name and not on the greedy model mapping (that can be extended), we need to hardcode the ortmodel in this dictionary. Other pipelines do not seem to have controlflow depending on the mapping name.
+        # See: https://github.com/huggingface/transformers/pull/24960/files
+        MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING_NAMES["ort_speechseq2seq"] = self.__class__.__name__
 
-    def get_encoder_onnx_config(encoder_config: "PretrainedConfig") -> SpeechSeq2SeqEncoderOnnxConfig:
-        return SpeechSeq2SeqEncoderOnnxConfig(encoder_config, task="default")
-
-    def get_decoder_onnx_config(
-        decoder_config: "PretrainedConfig", export_feature: str, use_past: bool = False
-    ) -> SpeechSeq2SeqDecoderOnnxConfig:
-        return SpeechSeq2SeqDecoderOnnxConfig(decoder_config, export_feature, use_past=use_past)
+    def _initialize_encoder(self, session: ort.InferenceSession) -> ORTEncoder:
+        return ORTEncoderForSpeech(session, self)
 
     @add_start_docstrings_to_model_forward(
-        SPEECH_SEQ2SEQ_ONNX_MODEL_DOCSTRING.format("batch_size, feature_size, sequence_length")
+        SPEECH_SEQ2SEQ_ONNX_MODEL_DOCSTRING
         + AUTOMATIC_SPEECH_RECOGNITION_EXAMPLE.format(
             processor_class=_PROCESSOR_FOR_DOC,
             model_class="ORTModelForSpeechSeq2Seq",
@@ -1321,31 +1232,29 @@ class ORTModelForSpeechSeq2Seq(ORTModelForConditionalGeneration, GenerationMixin
     def forward(
         self,
         input_features: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
         decoder_input_ids: Optional[torch.LongTensor] = None,
         encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Seq2SeqLMOutput:
-
         # Encode if needed : first prediction pass
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(input_features=input_features)
+            encoder_outputs = self.encoder(input_features=input_features, attention_mask=attention_mask)
 
-        # Decode
-        if past_key_values is None or self.decoder_with_past is None:
-            decoder_outputs = self.decoder(
-                input_ids=decoder_input_ids,
-                encoder_hidden_states=encoder_outputs.last_hidden_state,
-                labels=labels,
-            )
-        else:
-            decoder_outputs = self.decoder_with_past(
-                input_ids=decoder_input_ids[:, -1:],  # Cut decoder_input_ids if past is used
-                past_key_values=past_key_values,
-                encoder_hidden_states=encoder_outputs.last_hidden_state,
-                labels=labels,
-            )
+        model = (
+            self.decoder
+            if past_key_values is None or not self.use_cache or self.use_merged
+            else self.decoder_with_past
+        )
+        decoder_outputs = model(
+            input_ids=decoder_input_ids,
+            past_key_values=past_key_values,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=attention_mask,
+            cache_position=cache_position,
+        )
 
         return Seq2SeqLMOutput(
             loss=decoder_outputs.get("loss", None),
@@ -1355,19 +1264,204 @@ class ORTModelForSpeechSeq2Seq(ORTModelForConditionalGeneration, GenerationMixin
 
     def prepare_inputs_for_generation(
         self,
-        input_ids,
-        past=None,
+        decoder_input_ids,
+        past_key_values=None,
+        attention_mask=None,
         head_mask=None,
         decoder_head_mask=None,
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
-        **kwargs
+        **kwargs,
+    ):
+        # cut decoder_input_ids if past is used
+        if past_key_values is not None:
+            decoder_input_ids = decoder_input_ids[:, -1:]
+
+        return {
+            "encoder_outputs": encoder_outputs,
+            "past_key_values": past_key_values,
+            "decoder_input_ids": decoder_input_ids,
+            "attention_mask": attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "use_cache": use_cache,
+        }
+
+    def get_encoder(self) -> ORTEncoder:
+        return self.encoder
+
+    # Copied from transformers.models.bart.modeling_bart.BartForConditionalGeneration._reorder_cache
+    @staticmethod
+    def _reorder_cache(past, beam_idx) -> Tuple[Tuple[torch.FloatTensor]]:
+        reordered_past = ()
+        for layer_past in past:
+            # Cached cross_attention states don't have to be reordered -> they are always the same
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+            )
+        return reordered_past
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        model_id: Union[str, Path],
+        config: "PretrainedConfig",
+        **kwargs,
+    ):
+        if "WhisperForConditionalGeneration" in config.architectures:
+            return _ORTModelForWhisper._from_pretrained(model_id, config, **kwargs)
+        else:
+            return super()._from_pretrained(model_id, config, **kwargs)
+
+
+class _ORTModelForWhisper(ORTModelForSpeechSeq2Seq, WhisperForConditionalGeneration):
+    """
+    Whisper implements its own generate() method.
+    """
+
+    auto_model_class = WhisperForConditionalGeneration
+
+    # force the use of the WhisperForConditionalGeneration generate and prepare_inputs_for_generation methods
+    prepare_inputs_for_generation = WhisperForConditionalGeneration.prepare_inputs_for_generation
+    generate = WhisperForConditionalGeneration.generate
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        model_id: Union[str, Path],
+        config: "PretrainedConfig",
+        **kwargs,
+    ):
+        return super(ORTModelForSpeechSeq2Seq, cls)._from_pretrained(model_id, config, **kwargs)
+
+    class DummyWhisperModel:
+        def __init__(self):
+            self.encoder = self.Encoder()
+
+        class Encoder:
+            def __init__(self):
+                self.conv1 = self.Conv(stride=(1,))
+                self.conv2 = self.Conv(stride=(2,))
+
+            class Conv:
+                def __init__(self, stride):
+                    self.stride = stride
+
+    # a dummy model attribute that's used in the generate method to compute the input stride
+    # input_stride = self.model.encoder.conv1.stride[0] * self.model.encoder.conv2.stride[0]
+    model = DummyWhisperModel()
+
+
+@add_end_docstrings(ONNX_MODEL_END_DOCSTRING)
+class ORTModelForVision2Seq(ORTModelForConditionalGeneration, GenerationMixin):
+    """
+    VisionEncoderDecoder Sequence-to-sequence model with a language modeling head for ONNX Runtime inference. This class officially supports trocr and vision-encoder-decoder.
+    """
+
+    auto_model_class = AutoModelForVision2Seq
+    main_input_name = "pixel_values"
+
+    def __init__(
+        self,
+        encoder_session: ort.InferenceSession,
+        decoder_session: ort.InferenceSession,
+        config: "PretrainedConfig",
+        onnx_paths: List[str],
+        decoder_with_past_session: Optional[ort.InferenceSession] = None,
+        use_cache: bool = True,
+        use_io_binding: Optional[bool] = None,
+        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        preprocessors: Optional[List] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        **kwargs,
+    ):
+        # There are probably other archs that do not support cross attention KV cache, but only
+        # this one seem popular on the Hub.
+        if config.decoder.model_type == "gpt2":
+            self.no_cross_attention_cache = True
+
+        super().__init__(
+            encoder_session,
+            decoder_session,
+            config,
+            onnx_paths,
+            decoder_with_past_session,
+            use_cache,
+            use_io_binding,
+            model_save_dir,
+            preprocessors,
+            generation_config,
+            **kwargs,
+        )
+
+    def _initialize_encoder(self, session: ort.InferenceSession) -> ORTEncoder:
+        return ORTEncoderForVisionEncoderDecoder(session, self)
+
+    @add_start_docstrings_to_model_forward(
+        VISION_ENCODER_DECODER_SEQ2SEQ_ONNX_MODEL_DOCSTRING
+        + IMAGE_TO_TEXT_EXAMPLE.format(
+            processor_class=_IMAGE_PROCESSER_FOR_DOC,
+            tokenizer_class=_TOKENIZER_FOR_DOC,
+            model_class="ORTModelForVision2Seq",
+            checkpoint="nlpconnect/vit-gpt2-image-captioning",
+        )
+    )
+    def forward(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        **kwargs,
+    ) -> Seq2SeqLMOutput:
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(pixel_values=pixel_values)
+
+        model = (
+            self.decoder
+            if past_key_values is None or not self.use_cache or self.use_merged
+            else self.decoder_with_past
+        )
+
+        decoder_outputs = model(
+            input_ids=decoder_input_ids,
+            past_key_values=past_key_values,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+        )
+
+        return Seq2SeqLMOutput(
+            loss=decoder_outputs.loss,
+            logits=decoder_outputs.logits,
+            past_key_values=decoder_outputs.past_key_values,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
+        use_cache=None,
+        encoder_outputs=None,
+        **kwargs,
     ) -> Dict:
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
 
         return {
             "decoder_input_ids": input_ids,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "encoder_outputs": encoder_outputs,
             "head_mask": head_mask,
             "decoder_head_mask": decoder_head_mask,
@@ -1388,3 +1482,110 @@ class ORTModelForSpeechSeq2Seq(ORTModelForConditionalGeneration, GenerationMixin
                 tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
             )
         return reordered_past
+
+
+@add_end_docstrings(ONNX_MODEL_END_DOCSTRING)
+class ORTModelForPix2Struct(ORTModelForConditionalGeneration, GenerationMixin):
+    """
+    Pix2struct model with a language modeling head for ONNX Runtime inference. This class officially supports pix2struct.
+    """
+
+    # pix2struct cannot be loaded using AutoModel
+    auto_model_class = Pix2StructForConditionalGeneration
+    main_input_name = "flattened_patches"
+
+    def _initialize_encoder(self, session: ort.InferenceSession) -> ORTEncoder:
+        return ORTEncoderForPix2Struct(session, self)
+
+    @add_start_docstrings_to_model_forward(
+        PIX2STRUCT_ONNX_MODEL_DOCSTRING
+        + PIX2STRUCT_EXAMPLE.format(
+            processor_class=_PROCESSOR_FOR_DOC,
+            model_class="ORTModelForPix2Struct",
+            checkpoint="google/pix2struct-ai2d-base",
+        )
+    )
+    def forward(
+        self,
+        flattened_patches: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        **kwargs,
+    ) -> Seq2SeqLMOutput:
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                flattened_patches=flattened_patches,
+                attention_mask=attention_mask,
+            )
+
+        model = (
+            self.decoder
+            if self.use_merged or not self.use_cache or past_key_values is None
+            else self.decoder_with_past
+        )
+
+        decoder_outputs = model(
+            input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            past_key_values=past_key_values,
+            encoder_hidden_states=encoder_outputs.last_hidden_state,
+            encoder_attention_mask=attention_mask,
+        )
+
+        return Seq2SeqLMOutput(
+            loss=decoder_outputs.loss,
+            logits=decoder_outputs.logits,
+            past_key_values=decoder_outputs.past_key_values,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        flattened_patches: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        past_key_values=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
+        use_cache=None,
+        encoder_outputs=None,
+        **kwargs,
+    ) -> Dict:
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        if decoder_attention_mask is None:
+            decoder_attention_mask = torch.ones_like(input_ids).to(input_ids.device)
+
+        return {
+            "flattened_patches": flattened_patches,
+            "decoder_input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "encoder_outputs": encoder_outputs,
+            "attention_mask": attention_mask,
+            "decoder_attention_mask": decoder_attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "use_cache": use_cache,
+        }
+
+    def get_encoder(self) -> ORTEncoder:
+        return self.encoder
+
+    # Copied from transformers.models.bart.modeling_bart.BartForConditionalGeneration._reorder_cache
+    @staticmethod
+    def _reorder_cache(past, beam_idx) -> Tuple[Tuple[torch.FloatTensor]]:
+        ORTModelForSeq2SeqLM._reorder_cache(past, beam_idx)

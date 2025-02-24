@@ -8,7 +8,7 @@ from transformers.onnx.utils import get_preprocessor
 
 from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
 
-from ...pipelines import SUPPORTED_TASKS
+from ...pipelines import ORT_SUPPORTED_TASKS
 from ...pipelines import pipeline as _optimum_pipeline
 from ...runs_base import Run, TimeBenchmark, get_autoclass_name, task_processing_map
 from .. import ORTQuantizer
@@ -35,8 +35,8 @@ class OnnxRuntimeRun(Run):
             operators_to_quantize=run_config["operators_to_quantize"],
         )
 
-        onnx_model = SUPPORTED_TASKS[self.task]["class"][0].from_pretrained(
-            run_config["model_name_or_path"], from_transformers=True
+        onnx_model = ORT_SUPPORTED_TASKS[self.task]["class"][0].from_pretrained(
+            run_config["model_name_or_path"], export=True
         )
 
         trfs_model = FeaturesManager.get_model_from_feature(
@@ -65,9 +65,9 @@ class OnnxRuntimeRun(Run):
             ref_keys=run_config["dataset"]["ref_keys"],
             task_args=run_config["task_args"],
             static_quantization=self.static_quantization,
-            num_calibration_samples=run_config["calibration"]["num_calibration_samples"]
-            if self.static_quantization
-            else None,
+            num_calibration_samples=(
+                run_config["calibration"]["num_calibration_samples"] if self.static_quantization else None
+            ),
             config=trfs_model.config,
             max_eval_samples=run_config["max_eval_samples"],
         )

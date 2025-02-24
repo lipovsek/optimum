@@ -14,16 +14,51 @@
 # limitations under the License.
 """Utility functions."""
 
-from ctypes import c_float, sizeof
-from enum import Enum
-from typing import TYPE_CHECKING, Dict, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
-import packaging
+import torch
+from packaging import version
 from transformers.utils import is_tf_available, is_torch_available
 
+from ...utils import DIFFUSERS_MINIMUM_VERSION, ORT_QUANTIZE_MINIMUM_VERSION, logging
+from ...utils.import_utils import (
+    _diffusers_version,
+    is_diffusers_available,
+    is_diffusers_version,
+    is_transformers_version,
+)
+from ..utils import (
+    _get_submodels_and_export_configs,
+)
+from ..utils import (
+    get_decoder_models_for_export as _get_decoder_models_for_export,
+)
+from ..utils import (
+    get_diffusion_models_for_export as _get_diffusion_models_for_export,
+)
+from ..utils import (
+    get_encoder_decoder_models_for_export as _get_encoder_decoder_models_for_export,
+)
+from ..utils import (
+    get_sam_models_for_export as _get_sam_models_for_export,
+)
+from ..utils import (
+    get_speecht5_models_for_export as _get_speecht5_models_for_export,
+)
+
+
+logger = logging.get_logger()
+
+
+if is_diffusers_available():
+    if not is_diffusers_version(">=", DIFFUSERS_MINIMUM_VERSION.base_version):
+        raise ImportError(
+            f"We found an older version of diffusers {_diffusers_version} but we require diffusers to be >= {DIFFUSERS_MINIMUM_VERSION}. "
+            "Please update diffusers by running `pip install --upgrade diffusers`"
+        )
 
 if TYPE_CHECKING:
-    from .base import OnnxConfig
+    from ..base import ExportConfig
 
     if is_torch_available():
         from transformers.modeling_utils import PreTrainedModel
@@ -31,28 +66,34 @@ if TYPE_CHECKING:
     if is_tf_available():
         from transformers.modeling_tf_utils import TFPreTrainedModel
 
-MIN_TORCH_VERSION = packaging.version.parse("1.11.0")
-TORCH_VERSION = None
-if is_torch_available():
-    import torch
-
-    TORCH_VERSION = packaging.version.parse(torch.__version__)
-
-_is_torch_onnx_support_available = is_torch_available() and (MIN_TORCH_VERSION.major, MIN_TORCH_VERSION.minor) <= (
-    TORCH_VERSION.major,
-    TORCH_VERSION.minor,
-)
+    if is_diffusers_available():
+        from diffusers import DiffusionPipeline, ModelMixin
 
 
-def is_torch_onnx_support_available():
-    return _is_torch_onnx_support_available
+MODEL_TYPES_REQUIRING_POSITION_IDS = {
+    "codegen",
+    "falcon",
+    "gemma",
+    "gpt2",
+    "gpt-bigcode",
+    "gpt-neo",
+    "gpt-neox",
+    "gptj",
+    "imagegpt",
+    "llama",
+    "mistral",
+    "phi",
+    "phi3",
+    "qwen2",
+    "granite",
+}
 
 
-# This is the minimal required version to support some ONNX Runtime features
-ORT_QUANTIZE_MINIMUM_VERSION = packaging.version.parse("1.4.0")
+if is_transformers_version(">=", "4.45.99"):
+    MODEL_TYPES_REQUIRING_POSITION_IDS.add("opt")
 
 
-def check_onnxruntime_requirements(minimum_version: packaging.version.Version):
+def check_onnxruntime_requirements(minimum_version: version.Version):
     """
     Checks that ONNX Runtime is installed and if version is recent enough.
 
@@ -72,7 +113,7 @@ def check_onnxruntime_requirements(minimum_version: packaging.version.Version):
             " and relaunch the conversion."
         )
 
-    ort_version = packaging.version.parse(onnxruntime.__version__)
+    ort_version = version.parse(onnxruntime.__version__)
     if ort_version < ORT_QUANTIZE_MINIMUM_VERSION:
         raise ImportError(
             f"We found an older version of ONNX Runtime ({onnxruntime.__version__}) "
@@ -81,36 +122,139 @@ def check_onnxruntime_requirements(minimum_version: packaging.version.Version):
         )
 
 
+def recursive_to_device(value: Union[Tuple, List, "torch.Tensor"], device: str):
+    if isinstance(value, tuple):
+        value = list(value)
+        for i, val in enumerate(value):
+            value[i] = recursive_to_device(val, device)
+        value = tuple(value)
+    elif isinstance(value, list):
+        for i, val in enumerate(value):
+            value[i] = recursive_to_device(val, device)
+    elif isinstance(value, torch.Tensor):
+        value = value.to(device)
+
+    return value
+
+
+def recursive_to_dtype(
+    value: Union[Tuple, List, "torch.Tensor"], dtype: Optional[torch.dtype], start_dtype: Optional[torch.dtype] = None
+):
+    if dtype is None:
+        return value
+
+    if isinstance(value, tuple):
+        value = list(value)
+        for i, val in enumerate(value):
+            value[i] = recursive_to_dtype(val, dtype)
+        value = tuple(value)
+    elif isinstance(value, list):
+        for i, val in enumerate(value):
+            value[i] = recursive_to_dtype(val, dtype)
+    elif isinstance(value, torch.Tensor):
+        if start_dtype is None or (start_dtype is not None and value.dtype == start_dtype):
+            value = value.to(dtype=dtype)
+
+    return value
+
+
+# Copied from https://github.com/microsoft/onnxruntime/issues/7846#issuecomment-850217402
+class PickableInferenceSession:  # This is a wrapper to make the current InferenceSession class pickable.
+    def __init__(self, model_path, sess_options, providers):
+        import onnxruntime as ort
+
+        self.model_path = model_path
+        self.sess_options = sess_options
+        self.providers = providers
+        self.sess = ort.InferenceSession(self.model_path, sess_options=sess_options, providers=providers)
+
+    def run(self, *args):
+        return self.sess.run(*args)
+
+    def get_outputs(self):
+        return self.sess.get_outputs()
+
+    def get_inputs(self):
+        return self.sess.get_inputs()
+
+    def __getstate__(self):
+        return {"model_path": self.model_path}
+
+    def __setstate__(self, values):
+        import onnxruntime as ort
+
+        self.model_path = values["model_path"]
+        self.sess = ort.InferenceSession(self.model_path, sess_options=self.sess_options, providers=self.providers)
+
+
+def _get_submodels_and_onnx_configs(
+    model: Union["PreTrainedModel", "TFPreTrainedModel"],
+    task: str,
+    monolith: bool,
+    custom_onnx_configs: Dict,
+    custom_architecture: bool,
+    _variant: str,
+    library_name: str,
+    int_dtype: str = "int64",
+    float_dtype: str = "fp32",
+    fn_get_submodels: Optional[Callable] = None,
+    preprocessors: Optional[List[Any]] = None,
+    legacy: bool = False,
+    model_kwargs: Optional[Dict] = None,
+):
+    return _get_submodels_and_export_configs(
+        model,
+        task,
+        monolith,
+        custom_onnx_configs,
+        custom_architecture,
+        _variant,
+        library_name,
+        int_dtype,
+        float_dtype,
+        fn_get_submodels,
+        preprocessors,
+        legacy,
+        model_kwargs,
+        exporter="onnx",
+    )
+
+
+DEPRECATION_WARNING_GET_MODEL_FOR_EXPORT = "The usage of `optimum.exporters.onnx.utils.get_{model_type}_models_for_export` is deprecated and will be removed in a future release, please use `optimum.exporters.utils.get_{model_type}_models_for_export` instead."
+
+
+def get_diffusion_models_for_export(
+    pipeline: "DiffusionPipeline",
+    int_dtype: str = "int64",
+    float_dtype: str = "fp32",
+) -> Dict[str, Tuple[Union["PreTrainedModel", "ModelMixin"], "ExportConfig"]]:
+    logger.warning(DEPRECATION_WARNING_GET_MODEL_FOR_EXPORT.format(model_type="diffusion"))
+    return _get_diffusion_models_for_export(pipeline, int_dtype, float_dtype, exporter="onnx")
+
+
+def get_sam_models_for_export(model: Union["PreTrainedModel", "TFPreTrainedModel"], config: "ExportConfig"):
+    logger.warning(DEPRECATION_WARNING_GET_MODEL_FOR_EXPORT.format(model_type="sam"))
+    return _get_sam_models_for_export(model, config)
+
+
+def get_speecht5_models_for_export(
+    model: Union["PreTrainedModel", "TFPreTrainedModel"], config: "ExportConfig", model_kwargs: Optional[Dict]
+):
+    logger.warning(DEPRECATION_WARNING_GET_MODEL_FOR_EXPORT.format(model_type="speecht5"))
+    return _get_speecht5_models_for_export(model, config)
+
+
 def get_encoder_decoder_models_for_export(
-    model: Union["PreTrainedModel", "TFPreTrainedModel"], config: "OnnxConfig"
-) -> Dict[str, Tuple[Union["PreTrainedModel", "TFPreTrainedModel"], "OnnxConfig"]]:
-    """
-    Returns the encoder and decoder parts of the model and their subsequent onnx configs.
+    model: Union["PreTrainedModel", "TFPreTrainedModel"], config: "ExportConfig"
+) -> Dict[str, Tuple[Union["PreTrainedModel", "TFPreTrainedModel"], "ExportConfig"]]:
+    logger.warning(DEPRECATION_WARNING_GET_MODEL_FOR_EXPORT.format(mode_type="encoder_decoder"))
+    return _get_encoder_decoder_models_for_export(model, config)
 
-    Args:
-        model ([`PreTrainedModel`] or [`TFPreTrainedModel`]):
-            The model to export.
-        config ([`~exporters.onnx.config.OnnxConfig`]):
-            The ONNX configuration associated with the exported model.
 
-    Returns:
-        `Dict[str, Tuple[Union[`PreTrainedModel`, `TFPreTrainedModel`], `OnnxConfig`]: A Dict containing the model and
-        onnx configs for the encoder and decoder parts of the model.
-    """
-    models_for_export = dict()
-
-    encoder_model = model.get_encoder()
-    encoder_onnx_config = config.get_encoder_onnx_config(encoder_model.config)
-    models_for_export["encoder"] = (encoder_model, encoder_onnx_config)
-
-    decoder_model = model.get_decoder()
-    decoder_onnx_config = config.get_decoder_onnx_config(decoder_model.config, config.task, use_past=False)
-    models_for_export["decoder"] = (model, decoder_onnx_config)
-
-    if config.use_past:
-        decoder_onnx_config_with_past = config.get_decoder_onnx_config(
-            decoder_model.config, config.task, use_past=True
-        )
-        models_for_export["decoder_with_past"] = (model, decoder_onnx_config_with_past)
-
-    return models_for_export
+def get_decoder_models_for_export(
+    model: Union["PreTrainedModel", "TFPreTrainedModel"],
+    config: "ExportConfig",
+    legacy: bool = False,
+) -> Dict[str, Tuple[Union["PreTrainedModel", "TFPreTrainedModel"], "ExportConfig"]]:
+    logger.warning(DEPRECATION_WARNING_GET_MODEL_FOR_EXPORT.format(model_type="decoder"))
+    return _get_decoder_models_for_export(model, config, legacy)

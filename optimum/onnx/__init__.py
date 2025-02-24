@@ -11,4 +11,35 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-from .configuration import OnnxConfigWithLoss, OnnxConfigWithPastAndLoss, OnnxSeq2SeqConfigWithPastAndLoss
+from typing import TYPE_CHECKING
+
+from transformers.utils import _LazyModule
+
+
+_import_structure = {
+    "graph_transformations": [
+        "cast_slice_nodes_inputs_to_int32",
+        "merge_decoders",
+        "remove_duplicate_weights",
+        "replace_atenops_to_gather",
+        "remove_duplicate_weights_from_tied_info",
+    ],
+}
+
+if TYPE_CHECKING:
+    from .graph_transformations import (
+        cast_slice_nodes_inputs_to_int32,
+        merge_decoders,
+        remove_duplicate_weights,
+        remove_duplicate_weights_from_tied_info,
+        replace_atenops_to_gather,
+    )
+else:
+    import sys
+
+    sys.modules[__name__] = _LazyModule(
+        __name__,
+        globals()["__file__"],
+        _import_structure,
+        module_spec=__spec__,
+    )

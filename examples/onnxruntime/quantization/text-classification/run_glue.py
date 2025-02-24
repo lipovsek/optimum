@@ -23,30 +23,26 @@ import os
 import sys
 from dataclasses import dataclass, field
 from functools import partial
-from pathlib import Path
 from typing import Optional
 
 import datasets
 import numpy as np
 import transformers
 from datasets import load_dataset
+from evaluate import load
+from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
 from transformers import (
-    AutoConfig,
     AutoTokenizer,
     EvalPrediction,
     HfArgumentParser,
     PreTrainedTokenizer,
     TrainingArguments,
 )
-from transformers.onnx import FeaturesManager
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
-from evaluate import load
-from onnxruntime.quantization import QuantFormat, QuantizationMode, QuantType
 from optimum.onnxruntime import ORTQuantizer
 from optimum.onnxruntime.configuration import AutoCalibrationConfig, QuantizationConfig
-from optimum.onnxruntime.model import ORTModel
 from optimum.onnxruntime.modeling_ort import ORTModelForSequenceClassification
 from optimum.onnxruntime.preprocessors import QuantizationPreprocessor
 from optimum.onnxruntime.preprocessors.passes import (
@@ -55,6 +51,7 @@ from optimum.onnxruntime.preprocessors.passes import (
     ExcludeNodeAfter,
     ExcludeNodeFollowedBy,
 )
+from optimum.onnxruntime.utils import evaluation_loop
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -394,7 +391,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 
     # Export the model
-    model = ORTModelForSequenceClassification.from_pretrained(model_args.model_name_or_path, from_transformers=True)
+    model = ORTModelForSequenceClassification.from_pretrained(model_args.model_name_or_path, export=True)
 
     # Create the quantizer
     quantizer = ORTQuantizer.from_pretrained(model)
@@ -478,12 +475,15 @@ def main():
         quantization_preprocessor.register_pass(ExcludeNodeFollowedBy("Add", "Softmax"))
 
     # Apply quantization on the model
-    quantizer.quantize(
+    quantized_model_path = quantizer.quantize(
         save_dir=training_args.output_dir,
         calibration_tensors_range=ranges,
         quantization_config=qconfig,
         preprocessor=quantization_preprocessor,
         use_external_data_format=onnx_export_args.use_external_data_format,
+    )
+    model = ORTModelForSequenceClassification.from_pretrained(
+        quantized_model_path, provider=optim_args.execution_provider
     )
 
     # Evaluation
@@ -498,23 +498,23 @@ def main():
 
         try:
             eval_dataset = eval_dataset.align_labels_with_mapping(label2id=model.config.label2id, label_column="label")
-        except Exception as e:
+        except Exception:
             logger.warning(
-                f"\nModel label mapping: {onnx_model.config.label2id}"
+                f"\nModel label mapping: {model.config.label2id}"
                 f"\nDataset label features: {eval_dataset.features['label']}"
                 f"\nCould not guarantee the model label mapping and the dataset labels match."
                 f" Evaluation results may suffer from a wrong matching."
             )
 
-        ort_model = ORTModel(
-            Path(training_args.output_dir) / "model_quantized.onnx",
-            execution_provider=optim_args.execution_provider,
+        outputs = evaluation_loop(
+            model=model,
+            dataset=eval_dataset,
             compute_metrics=compute_metrics,
             label_names=["label"],
         )
-        outputs = ort_model.evaluation_loop(eval_dataset)
+
         # Save metrics
-        with open(os.path.join(training_args.output_dir, f"eval_results.json"), "w") as f:
+        with open(os.path.join(training_args.output_dir, "eval_results.json"), "w") as f:
             json.dump(outputs.metrics, f, indent=4, sort_keys=True)
 
     # Prediction
@@ -527,16 +527,15 @@ def main():
         if data_args.max_predict_samples is not None:
             predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
 
-        ort_model = ORTModel(
-            Path(training_args.output_dir) / "model_quantized.onnx",
-            execution_provider=optim_args.execution_provider,
+        outputs = evaluation_loop(
+            model=model,
+            dataset=predict_dataset,
             label_names=["label"],
         )
-        outputs = ort_model.evaluation_loop(predict_dataset)
         predictions = np.squeeze(outputs.predictions) if is_regression else np.argmax(outputs.predictions, axis=1)
 
         # Save predictions
-        output_predictions_file = os.path.join(training_args.output_dir, f"prediction.txt")
+        output_predictions_file = os.path.join(training_args.output_dir, "prediction.txt")
         with open(output_predictions_file, "w") as writer:
             logger.info(f"***** Predict results {data_args.task_name} *****")
             writer.write("index\tprediction\n")
