@@ -15,6 +15,8 @@
 
 from .constant import (
     CONFIG_NAME,
+    DIFFUSION_MODEL_CONFIG_FILE_NAME,
+    DIFFUSION_MODEL_ONNX_FILE_NAME,
     DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER,
     DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER,
     DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER,
@@ -22,6 +24,7 @@ from .constant import (
     DIFFUSION_MODEL_UNET_SUBFOLDER,
     DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER,
     DIFFUSION_MODEL_VAE_ENCODER_SUBFOLDER,
+    DIFFUSION_PIPELINE_CONFIG_FILE_NAME,
     ONNX_WEIGHTS_NAME,
 )
 from .import_utils import (
@@ -41,8 +44,10 @@ from .import_utils import (
     is_gptqmodel_available,
     is_onnx_available,
     is_onnxruntime_available,
+    is_onnxslim_available,
     is_pydantic_available,
     is_sentence_transformers_available,
+    is_tensorrt_available,
     is_tf_available,
     is_timm_available,
     is_torch_available,
@@ -55,6 +60,8 @@ from .import_utils import (
 from .input_generators import (
     DEFAULT_DUMMY_SHAPES,
     DTYPE_MAPPER,
+    ASTDummyAudioInputGenerator,
+    BartDummyTextInputGenerator,
     BloomDummyPastKeyValuesGenerator,
     Dinov2DummyInputGenerator,
     DummyAudioInputGenerator,
@@ -92,6 +99,8 @@ from .input_generators import (
     MistralDummyPastKeyValuesGenerator,
     MultiQueryPastKeyValuesGenerator,
     PerceiverDummyInputGenerator,
+    Speech2TextDummyAudioInputGenerator,
+    T5DummySeq2SeqPastKeyValuesGenerator,
     VitPoseDummyInputGenerator,
 )
 from .modeling_utils import recurse_getattr, recurse_setattr
