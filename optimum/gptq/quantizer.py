@@ -691,7 +691,13 @@ class GPTQQuantizer(object):
         layers = get_layers(model)
         layers = {n: layers[n] for n in quantizers}
 
-        self.select_quant_linear(device_map=model.hf_device_map, pack=True)
+        if hasattr(model, "hf_device_map"):
+            device_map = model.hf_device_map
+        else:
+            # Transformers: skip accelerate hooks when device_map resolves to a single device
+            device_map = {"": next(model.parameters()).device}
+
+        self.select_quant_linear(device_map=device_map, pack=True)
 
         self._replace_by_quant_layers(model, quantizers)
         qlayers = get_layers(model, [self.quant_linear])
